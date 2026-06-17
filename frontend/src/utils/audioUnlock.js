@@ -78,3 +78,17 @@ export function installAudioUnlock() {
   // pointerdown fast enough on the very first tap.
   window.addEventListener('touchstart', handler, opts);
 }
+
+// Test-only escape hatch. Not for production use — the unlock is meant to be
+// a one-shot per page load. Resetting lets unit tests exercise the unlock
+// path repeatedly against the same module instance.
+export function __resetForTesting() {
+  _unlocked = false;
+  _installed = false;
+  _resumeQueue.clear();
+  // Clear any listeners installAudioUnlock may have wired (capture-phase,
+  // once: true). removeEventListener is a no-op if the listener isn't
+  // registered, so call unconditionally — there's no way to reach the
+  // handler reference from outside, so we accept that already-fired listeners
+  // are gone (which is what `once:true` guarantees anyway).
+}
