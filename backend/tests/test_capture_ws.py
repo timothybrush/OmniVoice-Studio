@@ -60,9 +60,9 @@ class TestLoopbackGuard:
             / "api" / "routers" / "capture_ws.py"
         ).read_text(encoding="utf-8")
 
-    def test_ws_transcribe_references_loopback_hosts(self):
-        assert "_LOOPBACK_HOSTS" in self._src(), (
-            "capture_ws.py no longer references _LOOPBACK_HOSTS — the WS "
+    def test_ws_transcribe_references_loopback_check(self):
+        assert "is_local_host" in self._src(), (
+            "capture_ws.py no longer references is_local_host — the WS "
             "loopback guard has been removed. Reinstate it before accept()."
         )
 

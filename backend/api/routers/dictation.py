@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
-from api.dependencies import require_loopback
+from api.dependencies import require_local
 from core import prefs
 from services import sherpa_dictation as sd
 
@@ -54,7 +54,7 @@ def _read_prefs() -> dict:
     }
 
 
-@router.get("/dictation/models", dependencies=[Depends(require_loopback)])
+@router.get("/dictation/models", dependencies=[Depends(require_local)])
 def list_dictation_models():
     """The seven sherpa-onnx dictation models + install state.
 
@@ -85,7 +85,7 @@ def list_dictation_models():
     }
 
 
-@router.get("/dictation/prefs", dependencies=[Depends(require_loopback)])
+@router.get("/dictation/prefs", dependencies=[Depends(require_local)])
 def get_dictation_prefs():
     return _read_prefs()
 
@@ -96,7 +96,7 @@ class DictationPrefsUpdate(BaseModel):
     model_id: Optional[str] = None
 
 
-@router.post("/dictation/prefs", dependencies=[Depends(require_loopback)])
+@router.post("/dictation/prefs", dependencies=[Depends(require_local)])
 def set_dictation_prefs(req: DictationPrefsUpdate):
     """Persist any subset of the dictation prefs. Validates ``mode`` and
     ``model_id`` so a bad value can't wedge the capture engine."""

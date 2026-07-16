@@ -12,6 +12,7 @@ Currently exposed:
   keep their own inline loopback guards.
 """
 
+import ipaddress
 import os
 import secrets
 
@@ -25,6 +26,50 @@ from fastapi import HTTPException, Request
 # rather than parsed addresses. We accept the broader set without weakening
 # the guard: nothing here matches a non-loopback origin.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _trusted_networks():
+    """CIDR networks from OMNIVOICE_TRUSTED_NETWORKS (comma-separated) treated as
+    loopback-trusted — e.g. a reverse proxy or self-hosted LAN, so the API-key /
+    PIN gates don't block LAN clients that can't present the credential (a proxy
+    that strips the Authorization header). Read at call time (matching
+    `_server_mode` / `remote_api_key`) so tests can monkeypatch the env; restart
+    to apply changes in production."""
+    nets = []
+    for cidr in os.environ.get("OMNIVOICE_TRUSTED_NETWORKS", "").split(","):
+        cidr = cidr.strip()
+        if cidr:
+            try:
+                nets.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                pass  # malformed entry ignored — never wedge the auth gate
+    return nets
+
+
+def is_loopback(host):
+    """True loopback address only (127.0.0.1, ::1, localhost) — NOT a trusted
+    network. Admin gates (``require_loopback`` → ``/system/set-env``,
+    ``/api/settings/*``) use this so a trusted-network CIDR exempts consumption
+    (TTS / dictation) but never the RCE-class admin surface."""
+    return host in _LOOPBACK_HOSTS
+
+
+def is_local_host(host):
+    """Loopback address, OR on a configured trusted network. The consumption
+    gates (PIN/API-key middleware, WS guard) call this so a trusted LAN/proxy is
+    exempted. Admin gates use :func:`is_loopback` — NOT this — to preserve the
+    two-tier privilege model: consumption trust ≠ admin trust."""
+    if is_loopback(host):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        return False
+    # Unwrap IPv4-mapped IPv6 (::ffff:192.168.1.5) so it matches IPv4 CIDRs —
+    # dual-stack proxies (Caddy, Node.js) frequently pass the mapped form.
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return any(ip in net for net in _trusted_networks())
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -70,7 +115,23 @@ def require_loopback(request: Request) -> None:
     deployment's port mapping + the optional share PIN instead.
     """
     host = request.client.host if request.client else None
-    if host in _LOOPBACK_HOSTS:
+    if is_loopback(host):
+        return
+    if _server_mode():
+        return
+    raise HTTPException(status_code=403, detail="loopback origin required")
+
+
+def require_local(request: Request) -> None:
+    """Reject any request whose client.host is not loopback OR on a configured
+    trusted network. The consumption-tier companion to :func:`require_loopback`:
+    use on routes a trusted-network client (LAN/proxy) should reach without a PIN
+    or API key — e.g. the dictation model/prefs endpoints that pair with the
+    dictation WebSocket. Admin routes stay on :func:`require_loopback`.
+
+    In server mode the gate is a no-op (same as :func:`require_loopback`)."""
+    host = request.client.host if request.client else None
+    if is_local_host(host):
         return
     if _server_mode():
         return

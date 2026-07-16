@@ -114,4 +114,19 @@ remote key — is what's gating access.
 - Admin routes (`/system/*`, `/api/settings/*`) stay loopback-gated unless
   `OMNIVOICE_SERVER_MODE=1` is set on the box; in server mode the key is the
   access control for those too.
+- **Trust a LAN or reverse proxy with `OMNIVOICE_TRUSTED_NETWORKS`.** If you run
+  OmniVoice behind a reverse proxy (nginx, Caddy, NPM) or only expose it on a
+  trusted LAN/Tailnet, set `OMNIVOICE_TRUSTED_NETWORKS` to a comma-separated list
+  of CIDRs (e.g. `192.168.1.0/24,10.0.0.0/8`); clients from those networks are
+  then treated as trusted by the **consumption** gates (share PIN, API key,
+  dictation WebSocket) and need no key/PIN. **Admin routes** (`/system/*`,
+  `/api/settings/*`) stay true-loopback-only — use `OMNIVOICE_SERVER_MODE=1` for
+  headless admin. It's the granular alternative to
+  `OMNIVOICE_SERVER_MODE=1` (which trusts *all* non-loopback sources) and
+  sidesteps a proxy that strips the `Authorization` header. Default empty — no
+  change to the strict loopback default. Note: when combined with
+  `OMNIVOICE_SERVER_MODE=1` (which disables the admin loopback gate for Docker
+  NAT), trusted-network clients can also reach admin routes — in that mode
+  admin protection rests solely on the consumption middleware. Don't set
+  `OMNIVOICE_TRUSTED_NETWORKS` if you need admin protection in server mode.
 - The key is compared in constant time and never logged.
