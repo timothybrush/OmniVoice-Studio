@@ -903,6 +903,28 @@ def resolve_omnivoice_checkpoint() -> str:
     return _DEFAULT_OMNIVOICE_CHECKPOINT
 
 
+def _is_interpreter_shutdown_error(exc: "BaseException | None") -> bool:
+    """True when `exc` (or anything in its cause/context chain) is the
+    ``RuntimeError`` a ``ThreadPoolExecutor`` raises once Python has begun
+    interpreter shutdown — i.e. the operation was interrupted by the process
+    exiting, not by a real fault.
+
+    CPython's message is exactly ``"cannot schedule new futures after
+    interpreter shutdown"`` (vs. plain ``"…after shutdown"`` when only a single
+    pool was shut down), so matching ``"interpreter shutdown"`` distinguishes a
+    process teardown from an ordinary pool reset. Walks ``__cause__`` /
+    ``__context__`` because transformers' lazy-import + materialization
+    machinery wraps the original error several layers deep.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, RuntimeError) and "interpreter shutdown" in str(exc):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def _load_model_sync():
     global model
     from utils.hf_progress import register_listener, unregister_listener
@@ -1073,6 +1095,20 @@ def _load_model_sync():
         logger.info("OmniVoice model loaded successfully.")
         return _model
     except Exception as exc:
+        # A model load interrupted by *interpreter/process shutdown* is not a
+        # real fault — the backend is on its way out (uvicorn stopping, a failed
+        # port bind, or the user closing the app mid-load). transformers
+        # materializes weights in its OWN thread pool, which raises "cannot
+        # schedule new futures after interpreter shutdown" on the way down.
+        # Log that calmly instead of dressing an expected teardown up as a crash:
+        # otherwise the backend-crash report fills with a scary traceback for
+        # what is a normal shutdown, and /model/status flips to a phantom error.
+        if _is_interpreter_shutdown_error(exc):
+            logger.info(
+                "Model load aborted because the backend is shutting down "
+                "(interpreter teardown) — benign, not a failure."
+            )
+            raise
         # Surface an ACTIONABLE, sanitized error in /model/status (it's shown in
         # the first-run System Check). build_failure classifies the cause and
         # attaches a fix hint — e.g. a corrupted transformers install
