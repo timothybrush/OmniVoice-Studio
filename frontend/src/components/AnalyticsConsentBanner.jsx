@@ -12,8 +12,9 @@
  *   - Dismiss (X) → treated as No (analytics stays/goes off, `prompted` set);
  *     never shown again. Dismissal is a choice, not a snooze — nagging users
  *     into consent would be its own kind of dark pattern.
- *   - Backend unreachable / source build (no token) / already prompted /
- *     already opted in → renders nothing.
+ *   - Backend unreachable / destination-less build / already prompted /
+ *     already opted in → renders nothing. (Source builds have a destination
+ *     since #1193, so they get this same one-time ask.)
  */
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';

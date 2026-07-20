@@ -1020,8 +1020,9 @@ def get_analytics():
     return {
         "enabled": analytics.enabled(),
         "opted_in": analytics.user_opted_in(),
-        # False for source builds / any build with no token: analytics can never
-        # run, so the UI can say so instead of offering a toggle that does nothing.
+        # True for source builds too since #1193 (in-repo default token; env/baked
+        # overrides). False only for a destination-less build, where the UI can
+        # say so instead of offering a toggle that does nothing.
         "available": analytics.token_configured(),
         # Whether the user has ever been explicitly asked (first-run consent step
         # or the one-time banner). The UI uses this to ask exactly once — it never

@@ -29,7 +29,8 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 - Settings → Permissions + wizard System Check: live mic/Accessibility grant state, per-OS guidance, Open Settings deep-links; dictation pre-flights the mic grant (#1175)
 - `parakeet-mlx` engine: Parakeet TDT v3 on Apple Silicon — 25 EU languages, word timestamps, ~2 GB, opt-in from Settings → Models, never auto-downloads (#1175)
 - First-run downloads race the direct GitHub path against the mirror and use whichever answers fastest (#1179)
-- First-run consent question for the existing opt-in analytics (two equal buttons, skip = no; source builds never ask)
+- First-run consent question for the existing opt-in analytics (two equal buttons, skip = no)
+- Source builds carry the publishable analytics token and get the same first-run consent ask as installers; opt-in events now note the install channel (installer / docker / source) — thanks @agudmund! (#1193)
 - Official Google Colab notebook (`notebooks/OmniVoice_Studio_Colab.ipynb`) — full app + API feature tour on a free T4
 - ROCm Docker image `ghcr.io/debpalash/omnivoice-studio:rocm` (+ `:stable-rocm`, `:X.Y.Z-rocm`) (#1165)
 - `OMNIVOICE_TRUSTED_NETWORKS` — comma-separated CIDRs exempted from the consumption auth gates (share PIN / API key / dictation WS); admin routes stay loopback-only (#1170)

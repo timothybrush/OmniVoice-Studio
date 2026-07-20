@@ -4,10 +4,12 @@ OmniVoice is local-first, so analytics here is held to a higher bar than the
 usual SDK drop-in. Three rules, each enforced in code below and pinned by tests:
 
 1. **Off unless the user says yes.** Two independent gates must BOTH be true:
-   a build-provided ``POSTHOG_PROJECT_TOKEN`` *and* the user's explicit
-   ``analytics_enabled`` preference, which defaults to **False**. A default
-   install transmits nothing, so the product's promise holds out of the box.
-   ``OMNIVOICE_ANALYTICS_DISABLED=1`` is a hard kill switch that outranks both.
+   a configured destination token (the in-repo publishable default, overridden
+   by ``POSTHOG_PROJECT_TOKEN`` when set — see ``_PUBLIC_PROJECT_TOKEN``) *and*
+   the user's explicit ``analytics_enabled`` preference, which defaults to
+   **False**. A default install transmits nothing, so the product's promise
+   holds out of the box. ``OMNIVOICE_ANALYTICS_DISABLED=1`` is a hard kill
+   switch that outranks both.
 
 2. **No exception autocapture, ever.** The obvious SDK default
    (``enable_exception_autocapture=True``) ships raw tracebacks — which carry
@@ -42,6 +44,19 @@ _client_key: Optional[str] = None  # the (token, host) the live client was built
 _KILL_SWITCH = "OMNIVOICE_ANALYTICS_DISABLED"
 _OFF_VALUES = {"1", "true", "yes", "on"}
 
+#: In-repo default analytics destination (owner-sanctioned reversal, #1193):
+#: source builds get the SAME consent-gated analytics as installers. This is a
+#: PostHog *publishable* client key — write-only event ingestion, no data
+#: access; PostHog's own FAQ says these are designed to ship in client code —
+#: NOT a secret. It only names a destination: not one event leaves the machine
+#: without the user's explicit opt-in (see `enabled()`).
+#: A `POSTHOG_PROJECT_TOKEN` env var (release builds bake one in via the
+#: desktop shell; developers can point at their own project) always wins.
+#: Committed-token guard: tests/test_no_committed_analytics_token.py allows a
+#: `phc_` literal in exactly this file and frontend/src/utils/analytics.ts.
+_PUBLIC_PROJECT_TOKEN = "phc_v5wMjnYMPMaEcRNLRKQsTYCzPaYWh7wcHPhXNkNajVf9"  # gitleaks:allow — publishable write-only key (#1193)
+_DEFAULT_HOST = "https://eu.i.posthog.com"
+
 #: The ONLY property keys that may leave this machine. Anything else is dropped.
 #: Deliberately conservative: no free text, no paths, no names, no ids of user
 #: content. Add here only after asking "could this ever hold something the user
@@ -70,6 +85,7 @@ _ALLOWED_PROPS: frozenset[str] = frozenset({
     "uptime_bucket",    # app_crashed: BUCKETED prior-run uptime, never raw seconds
     "error_class",      # error_occurred/app_crashed: locked taxonomy key (GPU_OOM, …)
     "stage",            # error_occurred: coarse pipeline stage / route head only
+    "install_channel",  # installer | docker | source — closed set, never a path
 })
 
 #: A string property longer than this is refused outright — a belt-and-braces
@@ -130,11 +146,23 @@ def user_prompted() -> bool:
         return False
 
 
+def _resolved_token() -> str:
+    """The destination token: env (baked builds / developer override) wins,
+    the committed publishable default (#1193) is the fallback. Empty only when
+    both are blank — a destination-less build can never run analytics."""
+    return (os.environ.get("POSTHOG_PROJECT_TOKEN", "") or "").strip() or _PUBLIC_PROJECT_TOKEN
+
+
+def _resolved_host() -> str:
+    return (os.environ.get("POSTHOG_HOST") or _DEFAULT_HOST).strip()
+
+
 def token_configured() -> bool:
-    """Whether this BUILD ships an analytics destination at all. When false,
-    analytics can never run no matter what the user chooses — which is the case
-    for anyone building from source."""
-    return bool((os.environ.get("POSTHOG_PROJECT_TOKEN", "") or "").strip())
+    """Whether this build has an analytics destination at all. Since #1193 the
+    in-repo default means source builds have one too — so they get the same
+    first-run consent ask as installers. False only when both the env var and
+    the committed default are blank; consent stays the real gate regardless."""
+    return bool(_resolved_token())
 
 
 def enabled() -> bool:
@@ -152,8 +180,8 @@ def _get_client():
             shutdown()
         return None
 
-    token = os.environ["POSTHOG_PROJECT_TOKEN"].strip()
-    host = (os.environ.get("POSTHOG_HOST") or "https://eu.i.posthog.com").strip()
+    token = _resolved_token()
+    host = _resolved_host()
     key = f"{token}@{host}"
     if _client is not None and _client_key == key:
         return _client
@@ -274,8 +302,27 @@ def _platform() -> str:
     return {"darwin": "macos"}.get(_pl.system().lower(), _pl.system().lower() or "unknown")
 
 
+def install_channel() -> str:
+    """How this backend was distributed — a closed set, never derived from
+    paths or hostnames. "installer": the desktop shell sets
+    ``OMNIVOICE_INSTALL_CHANNEL=installer`` (backend.rs analytics_env()).
+    "docker": the image sets ``OMNIVOICE_SERVER_MODE=1`` (see
+    api/dependencies.py — the pre-existing Docker marker). Else "source"."""
+    ch = (os.environ.get("OMNIVOICE_INSTALL_CHANNEL", "") or "").strip().lower()
+    if ch in {"installer", "docker", "source"}:
+        return ch
+    # _OFF_VALUES doubles as the repo's canonical truthy-string set.
+    if (os.environ.get("OMNIVOICE_SERVER_MODE", "") or "").strip().lower() in _OFF_VALUES:
+        return "docker"
+    return "source"
+
+
 def _common_props() -> dict:
-    return {"app_version": _app_version(), "platform": _platform()}
+    return {
+        "app_version": _app_version(),
+        "platform": _platform(),
+        "install_channel": install_channel(),
+    }
 
 
 def uptime_bucket(seconds: Optional[float]) -> str:
@@ -414,8 +461,8 @@ def sync_uninstall_ping_info() -> None:
                 pass
             return
         payload = {
-            "token": os.environ["POSTHOG_PROJECT_TOKEN"].strip(),
-            "host": (os.environ.get("POSTHOG_HOST") or "https://eu.i.posthog.com").strip(),
+            "token": _resolved_token(),
+            "host": _resolved_host(),
             "distinct_id": installation_id(),
             "app_version": _app_version(),
             "platform": _platform(),

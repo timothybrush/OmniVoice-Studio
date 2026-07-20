@@ -38,6 +38,8 @@ def sent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
     monkeypatch.delenv("POSTHOG_PROJECT_TOKEN", raising=False)
     monkeypatch.delenv("OMNIVOICE_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.delenv("OMNIVOICE_INSTALL_CHANNEL", raising=False)
+    monkeypatch.delenv("OMNIVOICE_SERVER_MODE", raising=False)
     analytics.shutdown()
     analytics._reset_error_events_for_tests()
 
@@ -88,7 +90,8 @@ def test_installed_fires_once_and_only_once(sent, monkeypatch):
     analytics.record_startup_lifecycle(None)
     assert _names(sent).count("app_installed") == 1
     props = dict(sent[0][1])
-    assert set(props) <= {"app_version", "platform"}
+    assert set(props) <= {"app_version", "platform", "install_channel"}
+    assert props["install_channel"] == "source"  # no shell/docker marker in tests
 
 
 def test_installed_never_fires_without_consent_but_is_not_swallowed(sent, monkeypatch):
@@ -105,8 +108,10 @@ def test_installed_never_fires_without_consent_but_is_not_swallowed(sent, monkey
     assert _names(sent).count("app_installed") == 1
 
 
-def test_installed_never_fires_without_a_token(sent, monkeypatch):
-    analytics.set_opted_in(True)  # source build: consent but no destination
+def test_installed_never_fires_without_any_token(sent, monkeypatch):
+    # No destination at all: env absent AND the in-repo default (#1193) blanked.
+    monkeypatch.setattr(analytics, "_PUBLIC_PROJECT_TOKEN", "")
+    analytics.set_opted_in(True)  # consent but no destination
     analytics.record_startup_lifecycle(None)
     assert sent == []
 
@@ -334,6 +339,20 @@ def test_uninstall_ping_info_written_when_enabled_and_removed_when_not(
     assert not info.exists()
 
 
-def test_uninstall_ping_info_never_written_for_a_source_build(sent, monkeypatch, tmp_path):
-    analytics.set_opted_in(True)  # no token
+def test_uninstall_ping_info_written_for_a_source_build_with_the_default_token(
+    sent, monkeypatch, tmp_path
+):
+    """#1193: a consented source build has a destination (the in-repo default),
+    so the uninstall ping must work there too."""
+    analytics.set_opted_in(True)  # no env token → in-repo default
+    info = tmp_path / analytics.UNINSTALL_PING_INFO_BASENAME
+    assert info.exists()
+    payload = json.loads(info.read_text())
+    assert payload["token"] == analytics._PUBLIC_PROJECT_TOKEN
+    assert payload["host"] == "https://eu.i.posthog.com"
+
+
+def test_uninstall_ping_info_never_written_without_any_token(sent, monkeypatch, tmp_path):
+    monkeypatch.setattr(analytics, "_PUBLIC_PROJECT_TOKEN", "")  # destination-less build
+    analytics.set_opted_in(True)
     assert not (tmp_path / analytics.UNINSTALL_PING_INFO_BASENAME).exists()

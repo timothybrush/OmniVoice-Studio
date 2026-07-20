@@ -1,0 +1,18 @@
+# Gitleaks config — extends the default ruleset.
+#
+# The ONLY sanctioned allowlist entry is PostHog's publishable project token
+# (owner decision 2026-07-20, #1193). Per PostHog's docs the `phc_` project
+# token is a write-only client key with "no access to your private data" —
+# it ships in every release binary and every official PostHog SDK snippet.
+# It is NOT a credential. Personal keys (`phx_`) remain fully banned.
+# `tests/test_no_committed_analytics_token.py` separately pins the literal to
+# exactly two canonical files and requires both to carry the same value.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "PostHog publishable write-only project token (public by design; #1193)"
+regexes = [
+  '''phc_v5wMjnYMPMaEcRNLRKQsTYCzPaYWh7wcHPhXNkNajVf9''',
+]

@@ -10,8 +10,9 @@
  *     voice names, and any identity),
  *   - and that it can be turned off again at any time.
  *
- * When the build ships no analytics destination (any source build), the toggle
- * is not offered at all — an inert switch would be a lie. See
+ * When the build ships no analytics destination (rare since #1193 — the in-repo
+ * default token covers source builds too), the toggle is not offered at all —
+ * an inert switch would be a lie. See
  * backend/core/analytics.py for the enforcement (allowlist + no exception
  * autocapture) that makes the promises above true rather than aspirational.
  */

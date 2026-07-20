@@ -40,6 +40,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
     monkeypatch.delenv("POSTHOG_PROJECT_TOKEN", raising=False)
     monkeypatch.delenv("OMNIVOICE_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.delenv("OMNIVOICE_INSTALL_CHANNEL", raising=False)
+    monkeypatch.delenv("OMNIVOICE_SERVER_MODE", raising=False)
 
     class _InertPosthog:
         def __init__(self, *a, **k):
@@ -70,8 +72,29 @@ def test_off_by_default_even_when_the_build_ships_a_token(monkeypatch):
     assert analytics.enabled() is False
 
 
-def test_opting_in_without_a_token_still_cannot_transmit(monkeypatch):
-    """A source build has no destination — the toggle must not pretend otherwise."""
+def test_source_builds_have_a_destination_via_the_in_repo_default(monkeypatch):
+    """#1193: with no env/baked token, the committed publishable key is the
+    fallback — so source builds get the SAME consent flow as installers. Consent
+    is still the gate: available ≠ enabled."""
+    assert analytics.token_configured() is True  # no env token set by _isolate
+    assert analytics.enabled() is False          # …but silence is still not consent
+    analytics.set_opted_in(True)
+    assert analytics.enabled() is True
+
+
+def test_the_env_token_beats_the_in_repo_default(monkeypatch):
+    """Release builds bake a token through the shell env; developers set their
+    own. Either must override the committed default."""
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "  phc_env_wins  ")
+    assert analytics._resolved_token() == "phc_env_wins"
+    monkeypatch.delenv("POSTHOG_PROJECT_TOKEN")
+    assert analytics._resolved_token() == analytics._PUBLIC_PROJECT_TOKEN
+
+
+def test_opting_in_without_any_token_still_cannot_transmit(monkeypatch):
+    """A build with no destination at all (env absent AND in-repo default
+    blanked) — the toggle must not pretend otherwise."""
+    monkeypatch.setattr(analytics, "_PUBLIC_PROJECT_TOKEN", "")
     analytics.set_opted_in(True)
     assert analytics.user_opted_in() is True
     assert analytics.token_configured() is False
@@ -281,3 +304,26 @@ def test_installation_id_is_random_not_derived_from_the_machine():
 
     assert socket.gethostname() not in iid
     assert os.environ.get("USER", "nope") not in iid
+
+
+# ── install_channel: closed set, driven by env markers (#1193) ───────────────
+
+
+def test_install_channel_resolves_installer_docker_then_source(monkeypatch):
+    assert analytics.install_channel() == "source"  # bare source run
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")  # the Docker image's marker
+    assert analytics.install_channel() == "docker"
+    monkeypatch.setenv("OMNIVOICE_INSTALL_CHANNEL", "installer")  # desktop shell marker
+    assert analytics.install_channel() == "installer"
+    # A value outside the closed set falls through to the other markers.
+    monkeypatch.setenv("OMNIVOICE_INSTALL_CHANNEL", "franken-build")
+    monkeypatch.delenv("OMNIVOICE_SERVER_MODE")
+    assert analytics.install_channel() == "source"
+
+
+def test_install_channel_rides_wherever_app_version_does(monkeypatch):
+    """Attached via _common_props (the same place app_version is), and
+    allowlisted so the sanitizer doesn't strip it."""
+    props = analytics._common_props()
+    assert props["install_channel"] == "source"
+    assert analytics.sanitize_properties(props)["install_channel"] == "source"

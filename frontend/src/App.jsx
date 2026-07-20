@@ -1374,8 +1374,8 @@ function App() {
       <BackendCrashNotice />
 
       {/* One-time analytics consent ask for installs that predate the
-          first-run consent step. Renders nothing once any choice was made
-          (or in source builds, which have no analytics destination). */}
+          first-run consent step. Renders nothing once any choice was made.
+          Source builds get it too since #1193 (in-repo default token). */}
       <AnalyticsConsentBanner />
 
       {/* #567's visible half: while the shell auto-restarts a dead backend

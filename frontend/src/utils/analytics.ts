@@ -30,15 +30,20 @@
 import type { PostHog } from 'posthog-js';
 
 /**
- * Supplied at BUILD time, not committed. PostHog client tokens are publishable
- * (write-only event ingestion), but a token-shaped literal in the repo trips the
- * secret scanner and is a bad habit regardless — so the release build injects it,
- * exactly as the backend takes POSTHOG_PROJECT_TOKEN from the environment.
- *
- * No token => no destination => the Privacy toggle isn't even offered and nothing
- * can ever be sent. That is the correct default for a source build.
+ * In-repo default destination (owner-sanctioned reversal, #1193): source builds
+ * get the SAME consent-gated analytics as installers. This is a PostHog
+ * *publishable* client key — write-only event ingestion, no data access;
+ * PostHog's own FAQ says these are designed to ship in client code — NOT a
+ * secret. It only names a destination: nothing is ever sent without the user's
+ * explicit opt-in (init happens only after consent, see enableAnalytics()).
+ * A build-time VITE_POSTHOG_KEY (release builds; developers pointing at their
+ * own project) always wins over it — mirrors backend/core/analytics.py.
+ * tests/test_no_committed_analytics_token.py pins that a `phc_` literal may
+ * live in exactly this file and backend/core/analytics.py.
  */
-const POSTHOG_TOKEN: string = (import.meta.env?.VITE_POSTHOG_KEY as string) || '';
+const PUBLIC_PROJECT_TOKEN = 'phc_v5wMjnYMPMaEcRNLRKQsTYCzPaYWh7wcHPhXNkNajVf9'; // gitleaks:allow — publishable write-only key (#1193)
+const POSTHOG_TOKEN: string =
+  (import.meta.env?.VITE_POSTHOG_KEY as string) || PUBLIC_PROJECT_TOKEN;
 const POSTHOG_HOST: string =
   (import.meta.env?.VITE_POSTHOG_HOST as string) || 'https://eu.i.posthog.com';
 
@@ -73,6 +78,7 @@ const ALLOWED_PROPS = new Set([
   'uptime_bucket',
   'error_class',
   'stage',
+  'install_channel', // installer | docker | source — closed set, never a path
 ]);
 
 /** A string longer than this is refused outright, so free text can't ride in on
@@ -151,7 +157,8 @@ export function capture(event: string, props?: Record<string, unknown>): void {
 }
 
 /** On app start: turn analytics on ONLY if the backend says the user opted in.
- *  Anything else — backend down, no consent, source build — leaves it off. */
+ *  Anything else — backend down, no consent, destination-less build — leaves it
+ *  off. */
 export async function initAnalyticsFromConsent(
   fetchState: () => Promise<{ opted_in?: boolean; available?: boolean }>,
 ): Promise<boolean> {
