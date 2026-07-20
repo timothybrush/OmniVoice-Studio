@@ -808,7 +808,8 @@ export default function LogsFooter() {
                     if (notif.id?.startsWith('last-run-crash-')) {
                       import('../api/client')
                         .then(({ apiFetch }) =>
-                          apiFetch('/system/last-run-crash/ack', { method: 'POST' }))
+                          apiFetch('/system/last-run-crash/ack', { method: 'POST' }),
+                        )
                         .catch(() => {});
                     }
                     if (notif.action.type === 'navigate') {

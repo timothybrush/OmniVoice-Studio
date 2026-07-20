@@ -294,10 +294,9 @@ export const createPrefsSlice: StateCreator<PrefsSlice, [], [], PrefsSlice> = (s
     set((s) => ({
       // Dedupe + keep the newest 50: stable ids make re-dismissal a no-op,
       // and occurrence-stamped ids (last-run-crash-<ts>) age out the oldest.
-      dismissedNotificationIds: [
-        ...s.dismissedNotificationIds.filter((x) => x !== id),
-        id,
-      ].slice(-50),
+      dismissedNotificationIds: [...s.dismissedNotificationIds.filter((x) => x !== id), id].slice(
+        -50,
+      ),
     })),
   setAecEnabled: (on) => set({ aecEnabled: on }),
   setAutoPlayPreview: (on) => set({ autoPlayPreview: on }),
