@@ -13,6 +13,7 @@ import {
   zoomCenter,
   sliceToMono,
   selectionPlayhead,
+  loopWindow,
   decodeToMonoLowRate,
   DEFAULT_PEAK_BUCKETS,
 } from '../utils/audioTrim.js';
@@ -573,17 +574,19 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
       }
       if (ctx.state === 'suspended') ctx.resume().catch(() => {});
       const { start: s, end: e } = stateRef.current;
-      const seg = Math.max(0.01, e - s);
+      // loopWindow floors a zero-width/inverted selection so the loop range can
+      // never collapse and fall back to looping the whole buffer (#1210).
+      const { loopStart, loopEnd, seg } = loopWindow(s, e, buffer.duration);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);
       if (loopRef.current) {
         src.loop = true;
-        src.loopStart = s;
-        src.loopEnd = e;
-        src.start(0, s);
+        src.loopStart = loopStart;
+        src.loopEnd = loopEnd;
+        src.start(0, loopStart);
       } else {
-        src.start(0, s, seg);
+        src.start(0, loopStart, seg);
         src.onended = () => {
           if (sourceRef.current === src) stopPlayback();
         };
