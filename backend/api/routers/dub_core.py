@@ -1274,10 +1274,14 @@ async def dub_transcribe_stream(
         job["full_transcript"] = " ".join(s.get("text", "") for s in final_segs)
         _save_job(job_id, job)
 
-        # Restore TTS model to GPU now that ASR is done
+        # Restore TTS model to GPU now that ASR is done. unload() blocks
+        # (gc.collect + CUDA cache drop) — run it on the GPU pool so the
+        # event loop stays responsive; await it, because the TTS restore
+        # below must not contend with the ASR weights for VRAM
+        # (CodeRabbit review, #1198 — normal-completion half).
         if _asr_backend:
             try:
-                _asr_backend.unload()
+                await loop.run_in_executor(_gpu_pool, _asr_backend.unload)
             except Exception as e:
                 logger.warning("Failed to unload ASR backend: %s", e)
             # Unload attempted once — don't retry from gen()'s finally.
