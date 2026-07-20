@@ -443,13 +443,45 @@ did was `generate:start (audio)`, a dub, or a dictation.
 
 Newer builds **bound** every GPU job — whole-file transcription, **chunked dub
 transcription**, **and** TTS generation: instead of hanging forever and starving
-the backend, a wedged job now fails after a timeout with this exact guidance,
-and the worker pool is reset so capacity is restored automatically (no app
-restart needed). Tune the bounds with `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S`
-(whole-file transcription) and `OMNIVOICE_GENERATE_TIMEOUT_S` (generation) —
-both in seconds, default 300 — and `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S`
-(per-chunk dub transcription, default 120). **Raise** them for very long single
-files/generations, **lower** them to fail faster on a small machine.
+the backend, a wedged job fails after a timeout with this exact guidance. Tune
+the bounds with `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (whole-file transcription)
+and `OMNIVOICE_GENERATE_TIMEOUT_S` (generation) — both in seconds, default 300
+— and `OMNIVOICE_TRANSCRIBE_CHUNK_TIMEOUT_S` (per-chunk dub transcription,
+default 120). **Raise** them for very long single files/generations, **lower**
+them to fail faster on a small machine.
+
+**Two things changed here** ([#1190](https://github.com/debpalash/OmniVoice-Studio/issues/1190)):
+
+- **Waiting in line is no longer counted as compute.** The generate budget used
+  to start the moment a job was *queued*, so on a 1-worker machine a request
+  sitting behind a busy one burned its whole 300s without executing a single
+  instruction and then blamed your hardware. The budget now starts when a
+  worker actually picks the job up. Queue wait has its own, far more generous
+  bound (`OMNIVOICE_GPU_QUEUE_TIMEOUT_S`, default 1800s); crossing *that*
+  reports a saturated pool — an explicitly **retryable** condition, not a
+  too-heavy job.
+- **The old message over-promised.** It said "Capacity was restored
+  automatically". It wasn't: Python can't kill the abandoned worker thread, so
+  it keeps running — and keeps its VRAM — until it finishes on its own. The
+  pool reset only stops *new* work from queueing behind it. That is why an
+  immediate retry often failed too, and why a long batch could die a few
+  segments in. **Give the abandoned job time to drain (or restart the backend)
+  before retrying.** The message now says so.
+
+The generation budget also **scales with the length of the text** (the floor is
+`OMNIVOICE_GENERATE_TIMEOUT_S`, plus 1 second per 40 characters past the first
+1200), and every path uses it — the streaming preview the UI tries first, batch
+dubbing, `/v1/audio/speech`, and dub/archetype previews included. Long inputs
+should not need the env var at all.
+
+**Scripting the API?** `/v1/audio/speech` now tells you about pressure instead
+of going quiet: a **429** with a `Retry-After` header means the request was
+*refused before it started* because the worker pool is already backed up (safe
+to retry verbatim — nothing ran), and a **503** with `Retry-After` means the
+job was accepted but hit its bound. Both carry
+`X-OmniVoice-Retryable: true`, and the streaming NDJSON error frame carries
+`"retryable": true` with `retry_after`. Back off on those rather than
+hammering — on a 1-worker machine, concurrent requests serialize by design.
 
 **If transcribe timeouts keep repeating back-to-back**, pool resets aren't
 recovering the underlying hang — the wedged thread keeps its VRAM until the app

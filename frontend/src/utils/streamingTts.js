@@ -39,6 +39,13 @@ export class StreamingPreviewError extends Error {
   constructor(message, opts) {
     super(message, opts);
     this.name = 'StreamingPreviewError';
+    // #1190: the backend marks GPU-timeout / pool-saturation error frames
+    // `retryable`. Those are NOT worth re-rendering on the classic path — the
+    // whole text would be synthesized again against a pool still occupied by
+    // the abandoned job, so the user pays the same timeout twice before seeing
+    // the same error. Carried here so useTTS can tell the two apart.
+    this.retryable = opts?.retryable === true;
+    this.retryAfter = opts?.retryAfter ?? null;
   }
 }
 
@@ -318,7 +325,10 @@ export async function streamGenerateSpeech(
       } else if (ev.type === 'done') {
         meta = ev;
       } else if (ev.type === 'error') {
-        throw new StreamingPreviewError(ev.detail || 'TTS stream reported an error');
+        throw new StreamingPreviewError(ev.detail || 'TTS stream reported an error', {
+          retryable: ev.retryable === true,
+          retryAfter: ev.retry_after ?? null,
+        });
       }
     };
 

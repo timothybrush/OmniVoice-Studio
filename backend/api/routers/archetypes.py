@@ -169,9 +169,13 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
         )
 
     # Bounded + pool-reset on hang so a wedged preview render can't starve the
-    # GPU pool and brick the backend (#730 class).
+    # GPU pool and brick the backend (#730 class). Budget comes from the shared
+    # length-scaled helper (#1190) instead of the flat 300s default.
+    from services.model_manager import generate_timeout_s
+    _budget = generate_timeout_s(text)
     audio_tensor = await run_on_gpu_pool_guarded(
-        lambda: _infer(_PREVIEW_SEED), what="Archetype preview generate")
+        lambda: _infer(_PREVIEW_SEED), what="Archetype preview generate",
+        timeout=_budget)
     if _is_unusable_audio(audio_tensor):
         # Blank OR a degenerate tonal buzz — retry once on a different seed to
         # step off the bad diffusion trajectory. Static message only: the
@@ -179,7 +183,8 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
         # module constant, safe to log.
         logger.warning("Archetype rendered unusable at seed %d — retrying once", _PREVIEW_SEED)
         audio_tensor = await run_on_gpu_pool_guarded(
-            lambda: _infer(_PREVIEW_SEED + 1), what="Archetype preview generate")
+            lambda: _infer(_PREVIEW_SEED + 1), what="Archetype preview generate",
+            timeout=_budget)
     if _is_unusable_audio(audio_tensor):
         raise RuntimeError("the voice engine returned no audible audio for this archetype")
 
@@ -191,12 +196,18 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
     # never raises (degrades to unmarked on failure). User-uploaded/recorded
     # reference audio is human speech and is never marked — this only touches
     # audio the engine synthesized.
+    # Runs on the dedicated watermark pool (#1190): AudioSeal embedding is CPU
+    # work that holds no VRAM, so it must not occupy a GPU worker ahead of the
+    # next generate on 1-worker hosts.
     from services.watermark import mark_synthetic
+    from services.model_manager import get_watermark_pool
     import functools
     audio_tensor = await run_on_gpu_pool_guarded(
         functools.partial(mark_synthetic, audio_tensor, model.sampling_rate,
                           context="archetypes.render"),
         what="Archetype watermark",
+        timeout=generate_timeout_s(""),
+        executor=get_watermark_pool(),
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

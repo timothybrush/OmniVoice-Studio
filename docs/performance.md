@@ -78,7 +78,8 @@ None of them are required — the defaults are chosen for the common case.
 | `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB` | `6` | On unified memory (Apple Silicon): if free RAM is below this when a dub needs the transcription model, the TTS model is fully released first (it reloads on the next generation). Raise to be more aggressive about freeing, lower on 32 GB+ machines to avoid the reload. |
 | `OMNIVOICE_INDEXTTS_FP16` | `1` | IndexTTS half-precision. Leave on. |
 | `OMNIVOICE_ASR_VRAM_PREFLIGHT` | `1` | Downgrade transcription precision instead of crashing when VRAM is short (CUDA). Leave on. |
-| `OMNIVOICE_GENERATE_TIMEOUT_S` | `300` | Abandon a generation after this many seconds. Raise for very long single generations on slow hardware. |
+| `OMNIVOICE_GENERATE_TIMEOUT_S` | `300` | Abandon a generation after this many seconds **of actual compute** — the clock starts when a GPU worker picks the job up, never while it waits in line. It's a floor, not a ceiling: the budget grows with the text (+1 s per 40 characters past the first 1200), so long inputs rarely need this raised. |
+| `OMNIVOICE_GPU_QUEUE_TIMEOUT_S` | `1800` | How long a job may sit in the GPU queue before it's reported as a saturated pool (a retryable condition — nothing ran). Waiting is normal on 1-worker machines; lower this only if you'd rather fail fast than queue. |
 
 **torch.compile** is probe-based, not platform-based: it's attempted only
 where the runtime check says it can work (a CUDA device with Triton importable
@@ -91,10 +92,16 @@ install makes the probe pass but the compile attempt itself crash — see
 
 ## Flush caches / Unload resident model
 
-This is the feature the VRAM-starved timeout error ("TTS generate exceeded
-300s … Flush caches / Unload the resident model") points at. It frees
+This is the feature the VRAM-starved timeout error ("TTS generate ran for more
+than 300s … Flush caches / Unload the resident model") points at. It frees
 RAM/VRAM **without restarting the app**, and it never loses data — an
 unloaded model simply reloads lazily (~8 s) on the next generation.
+
+One thing Flush **can't** free: the job that just timed out. An abandoned
+generation cannot be killed from Python — its thread runs to completion and
+holds its VRAM until it does, so a Flush (or a retry) issued seconds after a
+timeout is competing with a job that is still on the device. Wait for it to
+drain, or restart the backend, and then Flush.
 
 **Where it lives:**
 

@@ -243,6 +243,32 @@ describe('streamGenerateSpeech', () => {
     expect(FakeAudioContext.instances[0].state).toBe('closed');
   });
 
+  it('carries the retryable marker from a GPU-timeout error frame (#1190)', async () => {
+    // A retryable failure means the backend already spent the full budget on
+    // this text and the abandoned job still holds the device — useTTS uses
+    // this flag to skip the classic re-render instead of paying the timeout
+    // a second time.
+    apiFetch.mockResolvedValue(
+      ndjsonResponse([
+        startEvent(3),
+        chunkEvent(0),
+        { type: 'error', detail: 'ran for more than 300s', retryable: true, retry_after: 45 },
+      ]),
+    );
+    const err = await streamGenerateSpeech(new FormData(), {}).catch((e) => e);
+    expect(err).toBeInstanceOf(StreamingPreviewError);
+    expect(err.retryable).toBe(true);
+    expect(err.retryAfter).toBe(45);
+
+    // A plain engine failure stays non-retryable → the classic fallback still
+    // applies, unchanged.
+    apiFetch.mockResolvedValue(
+      ndjsonResponse([startEvent(2), chunkEvent(0), { type: 'error', detail: 'engine boom' }]),
+    );
+    const plain = await streamGenerateSpeech(new FormData(), {}).catch((e) => e);
+    expect(plain.retryable).toBe(false);
+  });
+
   it('rejects with StreamingPreviewError when the stream ends without done', async () => {
     apiFetch.mockResolvedValue(ndjsonResponse([startEvent(2), chunkEvent(0)]));
     await expect(streamGenerateSpeech(new FormData(), {})).rejects.toThrow(StreamingPreviewError);

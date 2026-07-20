@@ -234,9 +234,13 @@ async def ws_tts(websocket: WebSocket):
                     # starve the GPU pool and brick the backend (#730 class). On
                     # timeout GpuJobTimeoutError propagates to the handler below,
                     # which sends an actionable error frame.
+                    # Length-scaled budget per sentence (#1190) — the flat 300s
+                    # default is gone from every dispatch.
+                    from services.model_manager import generate_timeout_s
                     wav_tensor, sr = await run_on_gpu_pool_guarded(
                         functools.partial(_generate, sentence),
                         what="TTS generate",
+                        timeout=generate_timeout_s(sentence),
                     )
 
                     if not started:

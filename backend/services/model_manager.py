@@ -132,6 +132,15 @@ class _ResilientGpuPool(Executor):
     def __init__(self):
         self._pool: "ThreadPoolExecutor | None" = None
         self._lock = threading.Lock()
+        # ── Queue accounting (#1190/#1202) ───────────────────────────────
+        # `queued` = submitted but not yet picked up by a worker; `running` =
+        # executing right now. Admission control (check_gpu_admission) and the
+        # Retry-After estimate both read these, so a scripted client learns the
+        # pool is saturated at SUBMIT instead of after a 300s silent wait.
+        self._stats_lock = threading.Lock()
+        self._queued = 0
+        self._running = 0
+        self._avg_job_s = 0.0  # EMA of completed job wall time
 
     def _live_pool(self) -> ThreadPoolExecutor:
         pool = self._pool
@@ -142,7 +151,7 @@ class _ResilientGpuPool(Executor):
                 pool = self._pool
         return pool
 
-    def submit(self, fn, /, *args, **kwargs):
+    def _submit_live(self, fn, /, *args, **kwargs):
         try:
             return self._live_pool().submit(fn, *args, **kwargs)
         except RuntimeError as e:
@@ -157,19 +166,82 @@ class _ResilientGpuPool(Executor):
                 pool = self._pool
             return pool.submit(fn, *args, **kwargs)
 
+    def submit(self, fn, /, *args, **kwargs):
+        # Every dispatch (guarded or raw run_in_executor) funnels through here,
+        # so wrapping the callable is the one place that sees queue→run→done
+        # for the whole pool.
+        token = {"counted": False}
+
+        def _tracked(*a, **kw):
+            with self._stats_lock:
+                token["counted"] = True
+                self._queued -= 1
+                self._running += 1
+            t0 = time.monotonic()
+            try:
+                return fn(*a, **kw)
+            finally:
+                elapsed = time.monotonic() - t0
+                with self._stats_lock:
+                    self._running -= 1
+                    self._avg_job_s = (
+                        elapsed if self._avg_job_s <= 0
+                        else 0.7 * self._avg_job_s + 0.3 * elapsed
+                    )
+
+        with self._stats_lock:
+            self._queued += 1
+        try:
+            fut = self._submit_live(_tracked, *args, **kwargs)
+        except BaseException:
+            with self._stats_lock:
+                if not token["counted"]:
+                    token["counted"] = True
+                    self._queued -= 1
+            raise
+
+        def _drain(_f, token=token):
+            # A job cancelled before a worker picked it up never runs _tracked;
+            # release its queue slot here so the depth can't drift upward.
+            with self._stats_lock:
+                if not token["counted"]:
+                    token["counted"] = True
+                    self._queued -= 1
+
+        fut.add_done_callback(_drain)
+        return fut
+
+    def stats(self) -> dict:
+        """Live queue depth / worker occupancy — the input to admission control."""
+        with self._stats_lock:
+            queued, running, avg = self._queued, self._running, self._avg_job_s
+        pool = self._pool
+        workers = getattr(pool, "_max_workers", None) or 1
+        return {"queued": queued, "running": running,
+                "workers": workers, "avg_job_s": avg}
+
     def reset(self) -> None:
         """Abandon the current worker pool; the next submit builds a fresh one.
 
-        Python can't kill a thread wedged in a timed-out load, but dropping the
-        poisoned pool means a retry gets a clean worker instead of queueing
-        behind the wedged one. The wrapper identity is preserved, so references
-        held by importers stay valid.
+        Deliberately **not** ``cancel_futures=True`` (#1190/#1202): that killed
+        innocent peers — a queued job belonging to a *different* request was
+        cancelled because *this* request timed out, and surfaced to that caller
+        as a bare ``CancelledError``. ``shutdown(wait=False)`` only refuses NEW
+        submissions; work already in the old pool's queue still drains on the
+        old pool's workers, so peers complete normally while new work goes to
+        the fresh pool.
+
+        Honesty about what this reclaims: **nothing**. Python cannot kill the
+        thread wedged in the timed-out job — it keeps running (and keeps its
+        VRAM) until it finishes on its own. Dropping the pool only stops NEW
+        work from queueing behind it; it does not restore the device. That is
+        why the timeout guidance no longer claims capacity was restored.
         """
         with self._lock:
             pool, self._pool = self._pool, None
         if pool is not None:
             try:
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.shutdown(wait=False)
             except Exception:
                 pass
 
@@ -214,41 +286,220 @@ def __getattr__(name: str):
 # guard generalised so every GPU dispatch shares one recovery path.
 GPU_JOB_TIMEOUT_S = float(os.environ.get("OMNIVOICE_GENERATE_TIMEOUT_S", "300.0"))
 
+# Queue-wait budget — a SEPARATE, deliberately generous clock (#1190/#1202).
+# The execution bound above must never be spent waiting in line: a job queued
+# behind a busy 1-worker pool used to burn its whole 300s budget without
+# executing a single instruction and then be told it was "too heavy for the
+# available compute". Waiting long is normal on a 1-worker host (that is what
+# serialization means); waiting *forever* is not, so the queue still has a
+# bound — crossing it means saturation, which is a retryable 503, not a
+# too-heavy job.
+GPU_QUEUE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_GPU_QUEUE_TIMEOUT_S", "1800.0"))
+
 
 class GpuJobTimeoutError(TimeoutError):
-    """A GPU-pool job exceeded its wall-clock bound and was abandoned.
+    """A GPU-pool job **that actually started executing** overran its bound.
 
-    The backend is alive — the job was too heavy for the available compute
-    (most often a VRAM-starved GPU). Pool capacity is restored automatically by
-    resetting the pool; the message carries the durable fix.
+    Only raised once a worker picked the job up, so the message's "too heavy
+    for the available compute" reading is truthful. Queue wait is bounded
+    separately and surfaces as :class:`GpuPoolBusyError`.
     """
+
+
+class GpuPoolBusyError(TimeoutError):
+    """The GPU pool is saturated — the job never started, so nothing was lost.
+
+    Retryable verbatim: no compute was spent, no partial state exists. Carries
+    ``retry_after`` (seconds) so HTTP callers can emit a real ``Retry-After``
+    and scripted clients can back off instead of hammering a busy backend.
+    """
+
+    def __init__(self, message: str, *, retry_after: float = 30.0):
+        super().__init__(message)
+        self.retry_after = max(1, int(round(retry_after)))
+
+
+def generate_timeout_s(text: "str | None") -> float:
+    """THE wall-clock execution budget for one synthesis job, scaled to input.
+
+    Single source of truth for every TTS dispatch (#1190/#1202). The
+    length-scaled budget landed in v0.3.22 but was wired into only two call
+    sites in generation.py's classic path — the streaming path the UI tries
+    FIRST, plus /v1/audio/speech, batch, dub and archetype previews, all still
+    used the flat 300s, which is why 0.3.22 users kept seeing "exceeded 300s"
+    on long inputs. Lives here (not in a router) so every router shares it
+    without importing generation.py.
+
+    Policy: floor at the configured OMNIVOICE_GENERATE_TIMEOUT_S, plus 1s per
+    40 characters past a 1200-character free allowance — generous enough for
+    CPU-class hardware, still bounded (a wedged job is caught in minutes, not
+    hours).
+    """
+    return max(
+        GPU_JOB_TIMEOUT_S,
+        GPU_JOB_TIMEOUT_S + (max(0, len(text or "") - 1200) / 40.0),
+    )
+
+
+def _retry_after_estimate(stats: dict) -> float:
+    """Seconds a caller should wait before retrying, from live pool state.
+
+    Queue depth ahead of you, divided by workers, times a recent job's wall
+    time. Bounded to 5..300s so the hint is always usable (and never zero on a
+    cold pool with no timing history yet)."""
+    base = stats.get("avg_job_s") or 0.0
+    if base <= 0:
+        base = 30.0
+    workers = max(1, int(stats.get("workers") or 1))
+    waves = (int(stats.get("queued") or 0) + 1) / workers
+    return max(5.0, min(300.0, base * waves))
+
+
+def gpu_pool_stats(executor=None) -> dict:
+    """Live pool occupancy, or a permissive default for executors that don't
+    track it (plain ThreadPoolExecutor in tests / injected executors)."""
+    ex = executor if executor is not None else _get_gpu_pool()
+    fn = getattr(ex, "stats", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 — telemetry must never break a request
+            pass
+    return {"queued": 0, "running": 0, "workers": 1, "avg_job_s": 0.0}
+
+
+def check_gpu_admission(*, what: str = "GPU job", executor=None) -> None:
+    """Admission control at SUBMIT (#1190/#1202) — raise before queueing when
+    the pool is already backed up.
+
+    Policy: refuse when ``queued >= workers`` — every worker is busy AND a full
+    wave of jobs is *already waiting* ahead of this one. Deliberately NOT the
+    stricter "no worker is free": on the 1-worker hosts this bug hurts most,
+    that would reject the ordinary second concurrent request the desktop UI
+    issues routinely and which completes fine today. The looser rule still
+    catches the case that matters — a scripted client fanning out N requests at
+    a pool that can only serialize them — and turns a silent multi-minute wait
+    into an immediate, honest "retry in N seconds".
+    """
+    stats = gpu_pool_stats(executor)
+    if stats.get("queued", 0) < max(1, int(stats.get("workers") or 1)):
+        return
+    retry_after = _retry_after_estimate(stats)
+    raise GpuPoolBusyError(
+        f"{what} was not accepted: the local GPU worker pool is saturated "
+        f"({stats.get('running', 0)} running, {stats.get('queued', 0)} already "
+        f"queued on {stats.get('workers', 1)} worker(s)). Nothing was started, "
+        f"so this request is safe to retry as-is in about "
+        f"{int(retry_after)}s. To raise throughput, run fewer "
+        f"concurrent requests, or set OMNIVOICE_GPU_WORKERS if the machine has "
+        f"spare VRAM.",
+        retry_after=retry_after,
+    )
+
+
+def _swallow_abandoned(fut) -> None:
+    """Consume the result of a future we stopped awaiting, so an abandoned
+    wedged job can't emit "Future exception was never retrieved" noise."""
+    try:
+        if not fut.cancelled():
+            fut.exception()
+    except BaseException:  # noqa: BLE001 — best-effort cleanup only
+        pass
 
 
 async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
-                                  timeout: float = GPU_JOB_TIMEOUT_S,
-                                  executor=None):
-    """Run blocking ``fn`` on the GPU pool with a hard wall-clock bound.
+                                  timeout: "float | None" = None,
+                                  executor=None,
+                                  queue_timeout: "float | None" = None):
+    """Run blocking ``fn`` on the GPU pool, bounding **execution** — not the
+    wait for a free worker.
 
-    On timeout, ``reset()`` the pool (abandon the wedged worker so the next
-    submit gets a fresh one) and raise :class:`GpuJobTimeoutError`. ``fn`` must
-    be a zero-arg callable — wrap args with ``functools.partial`` at the call
-    site. Deliberately mirrors ``asr_backend.run_transcribe_guarded`` so every
-    GPU dispatch shares one bound+recover path (#730 class). Executors without
-    ``reset`` (a plain ThreadPoolExecutor in tests) still get the bound + error.
+    Two clocks (#1190/#1202):
+
+    * ``queue_timeout`` (generous, ``GPU_QUEUE_TIMEOUT_S``) covers the time the
+      job sits in the pool queue. Exceeding it raises :class:`GpuPoolBusyError`
+      — the job is cancelled out of the queue before it ever runs, so no
+      compute is wasted and the caller can retry verbatim.
+    * ``timeout`` (``GPU_JOB_TIMEOUT_S`` by default) starts only when a worker
+      actually picks the job up. Exceeding *that* is a genuinely wedged/too-slow
+      job → :class:`GpuJobTimeoutError` + pool ``reset()``.
+
+    Previously both were one clock started at submit: ``run_in_executor``
+    returns immediately, so a job queued behind a busy 1-worker pool burned its
+    entire budget waiting and then reported "too heavy for the available
+    compute" without having executed one instruction.
+
+    ``fn`` must be a zero-arg callable — wrap args with ``functools.partial``.
+    Executors without ``reset`` (a plain ThreadPoolExecutor in tests) still get
+    both bounds; only the reset step is skipped.
     """
     loop = asyncio.get_running_loop()
     ex = executor if executor is not None else _get_gpu_pool()
-    fut = loop.run_in_executor(ex, contain_system_exit(fn, what))
+    # Resolved at CALL time, not def time, so monkeypatching/reloading the
+    # module constant reaches every call site (the old default bound at def).
+    timeout = GPU_JOB_TIMEOUT_S if timeout is None else float(timeout)
+    queue_timeout = GPU_QUEUE_TIMEOUT_S if queue_timeout is None else float(queue_timeout)
+
+    started = asyncio.Event()
+    _inner = contain_system_exit(fn, what)
+
+    def _job():
+        # First thing the worker does: tell the awaiting coroutine the
+        # execution clock may start. call_soon_threadsafe is the only
+        # loop-safe way to touch an asyncio primitive from a pool thread.
+        try:
+            loop.call_soon_threadsafe(started.set)
+        except RuntimeError:
+            pass  # loop already closed (caller vanished) — still run the job
+        return _inner()
+
+    fut = loop.run_in_executor(ex, _job)
+    waiter = asyncio.ensure_future(started.wait())
+    try:
+        # Phase 1 — queue wait. Watch the future too, so a job that fails or is
+        # cancelled while still queued resolves here instead of hanging.
+        done, _pending = await asyncio.wait(
+            {waiter, fut}, timeout=queue_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        waiter.cancel()
+
+    if not done:
+        # Never picked up: cancel it out of the queue (a not-yet-started
+        # concurrent future cancels cleanly) and report saturation, NOT a
+        # too-heavy job.
+        fut.cancel()
+        _swallow_abandoned(fut)
+        stats = gpu_pool_stats(ex)
+        logger.warning(
+            "%s waited %.0fs for a free GPU worker and was never started "
+            "(%d queued / %d running) — reporting pool saturation (#1190).",
+            what, queue_timeout, stats.get("queued", 0), stats.get("running", 0),
+        )
+        raise GpuPoolBusyError(
+            f"{what} waited {queue_timeout:.0f}s for a free GPU worker and "
+            f"never started, so nothing was computed and the request is safe "
+            f"to retry as-is. The backend is alive but every worker is busy "
+            f"with earlier jobs. Run fewer concurrent requests, or raise "
+            f"OMNIVOICE_GPU_WORKERS if the machine has spare VRAM.",
+            retry_after=_retry_after_estimate(stats),
+        )
+
+    # Phase 2 — execution. The clock starts here: this job owns a worker.
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
+        _swallow_abandoned(fut)
         _reset = getattr(ex, "reset", None)
         if callable(_reset):
             try:
                 _reset()
                 logger.warning(
-                    "%s exceeded %.0fs — abandoned the GPU-pool worker to "
-                    "restore capacity (#730).", what, timeout,
+                    "%s exceeded %.0fs of EXECUTION time — abandoned the "
+                    "GPU-pool worker; it keeps running (and holding the "
+                    "device) until it finishes on its own (#730/#1190).",
+                    what, timeout,
                 )
             except Exception:
                 logger.exception("GPU pool reset after %s timeout failed", what)
@@ -258,7 +509,16 @@ async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
 def _timeout_guidance(what: str, timeout: float) -> str:
     """Device-aware timeout message (#896): a CPU-only host must never be told
     to "set the engine to CPU" or blamed on VRAM — on CPU the job is simply
-    compute-bound. GPU hosts keep the VRAM-contention guidance."""
+    compute-bound. GPU hosts keep the VRAM-contention guidance.
+
+    Honesty fix (#1190/#1202): this used to promise "Capacity was restored
+    automatically". It was not. Python cannot kill the abandoned worker
+    thread — it runs to completion still holding its VRAM, so an immediate
+    retry contends with the zombie and is *more* likely to fail, which is
+    exactly how one slow chunk cascaded into a whole failed batch. The message
+    now says what actually happens and gives both interactive and scripted
+    callers something to do about it.
+    """
     family = "cuda"  # conservative default: GPU wording if the probe fails
     try:
         from core.device_caps import detect_host_caps
@@ -266,9 +526,12 @@ def _timeout_guidance(what: str, timeout: float) -> str:
     except Exception:  # noqa: BLE001 — guidance must never mask the timeout
         pass
     common = (
-        f"{what} exceeded {timeout:.0f}s and was abandoned — the backend is "
-        "running, but the job was too heavy for the available compute. "
-        "Capacity was restored automatically; "
+        f"{what} ran for more than {timeout:.0f}s of actual compute time and "
+        "was abandoned — the backend is running, but this job was too heavy "
+        "for the available compute. The abandoned job cannot be killed: it "
+        "keeps running and keeps holding the device until it finishes on its "
+        "own, so an immediate retry competes with it. Wait for the current "
+        "job to drain (or restart the backend) before retrying; "
     )
     if family == "cpu":
         return common + (
@@ -286,6 +549,33 @@ def _timeout_guidance(what: str, timeout: float) -> str:
         "Settings → Models. (Raise OMNIVOICE_GENERATE_TIMEOUT_S for very "
         "long single generations.)"
     )
+
+
+# ── Watermark pool (#1169 load, split out in #1190) ──────────────────────
+# AudioSeal's generator is loaded with `AudioSeal.load_generator(...)` and
+# never moved to an accelerator: `embed_watermark` is CPU work on CPU tensors.
+# Running it on the GPU pool therefore reserves a *GPU* worker for a job that
+# uses no VRAM — and since #1169 routed every producer (including per-chunk
+# stream previews) through mark_synthetic, on an 8 GB host (exactly 1 GPU
+# worker) each watermark embed serialized directly ahead of the next generate,
+# doubling the effective queue depth of a streamed multi-chunk render.
+# Giving it its own tiny pool removes that head-of-line blocking with no VRAM
+# risk, because the work was never on the device to begin with.
+_watermark_pool_singleton: "ThreadPoolExecutor | None" = None
+_watermark_pool_lock = threading.Lock()
+
+
+def get_watermark_pool() -> ThreadPoolExecutor:
+    """Dedicated 1-worker pool for provenance marking. Built lazily so hosts
+    with watermarking disabled never spawn the thread."""
+    global _watermark_pool_singleton
+    if _watermark_pool_singleton is None:
+        with _watermark_pool_lock:
+            if _watermark_pool_singleton is None:
+                _watermark_pool_singleton = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="watermark",
+                )
+    return _watermark_pool_singleton
 
 
 model = None  # type: ignore
