@@ -495,7 +495,23 @@ async def dub_transcribe_stream(
                 # before emitting any event, and the UI shows a misleading generic
                 # "stream dropped" message instead of the real cause (issue #255).
                 try:
-                    _model = await get_model()
+                    # Same keepalive treatment as the ASR load below: a cold
+                    # TTS load can outlast a reverse proxy's per-read idle
+                    # timeout (~60-120 s nginx/Caddy defaults) — the initial
+                    # open comment stops the browser's no-response clock but
+                    # does not reset a proxy's idle timer.
+                    _model_task = asyncio.ensure_future(get_model())
+                    _model_task.add_done_callback(
+                        lambda f: f.cancelled() or f.exception()
+                    )
+                    while True:
+                        _done, _ = await asyncio.wait(
+                            {_model_task}, timeout=ASR_LOAD_KEEPALIVE_S
+                        )
+                        if _done:
+                            break
+                        yield b": tts-load keepalive\n\n"
+                    _model = _model_task.result()
                 except Exception as e:
                     logger.exception("transcribe preflight: model load failed (job=%s)", job_id)
                     from core.failure import build_failure
@@ -565,6 +581,15 @@ async def dub_transcribe_stream(
                                     load_active_asr_backend,
                                     asr_pipe=getattr(_model, "_asr_pipe", None),
                                 ),
+                            )
+                            # On client disconnect the ASGI server cancels this
+                            # generator mid-wait; the executor load keeps
+                            # running (and still caches its result). Retrieve
+                            # its eventual exception so asyncio never logs
+                            # "Task exception was never retrieved" into the
+                            # crash forensics log.
+                            _load_fut.add_done_callback(
+                                lambda f: f.cancelled() or f.exception()
                             )
                             # Keepalive while the load runs (#1196): a first-run
                             # load may download weights for minutes, and a
