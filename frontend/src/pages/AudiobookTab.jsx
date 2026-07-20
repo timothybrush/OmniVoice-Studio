@@ -5,11 +5,10 @@ import {
   BookOpen,
   BookText,
   Code,
-  Download,
   Loader,
-  Play,
   SlidersHorizontal,
   SpellCheck,
+  Square,
   Upload,
 } from 'lucide-react';
 
@@ -30,6 +29,9 @@ import AudiobookOverrides, { overridesToRequest } from '../components/audiobook/
 import Section from '../components/audiobook/Section';
 import BookDetails from '../components/audiobook/BookDetails';
 import LexiconEditor from '../components/audiobook/LexiconEditor';
+import GenerationProgress from '../components/audiobook/GenerationProgress';
+import PlanList from '../components/audiobook/PlanList';
+import AudiobookResult from '../components/audiobook/AudiobookResult';
 import { SAMPLE_AUDIOBOOK_SCRIPT } from '../data/sampleAudiobook';
 import ALL_LANGUAGES from '../languages.json';
 import { POPULAR_LANGS } from '../utils/constants';
@@ -87,7 +89,11 @@ export default function AudiobookTab({ profiles = [] }) {
   const [plan, setPlan] = useState(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [progress, setProgress] = useState(null); // {current,total,title,assembling}
+  // Per-chapter live progress (#1216): [{ title, status }] where status is
+  // pending | rendering | done | cached | failed. Drives GenerationProgress.
+  const [chapters, setChapters] = useState([]);
+  const [assembling, setAssembling] = useState(false);
+  const [stopped, setStopped] = useState(false);
   // Store-backed (#1139): the finished render's filename used to be component
   // useState, so the player + Download link vanished on the first tab switch —
   // users reported "no way to export". It now survives tab switches/reloads.
@@ -97,6 +103,19 @@ export default function AudiobookTab({ profiles = [] }) {
   const [done, setDone] = useState(null); // {cached_chapters, failed_chapters}
   const [chapterPrev, setChapterPrev] = useState({}); // index → {url, loading}
   const abortRef = useRef(false);
+  const abortControllerRef = useRef(null); // per-generation fetch AbortController
+
+  // Abort an in-flight generation when the tab unmounts. Without this, leaving
+  // mid-render keeps the stream (and the backend job) running, and a late
+  // done/error event could clobber the store's output from a generation the
+  // user started after coming back. Mirrors the manual Stop.
+  useEffect(
+    () => () => {
+      abortRef.current = true;
+      abortControllerRef.current?.abort();
+    },
+    [],
+  );
 
   // Output prefs + metadata (embedded in the file; players show these) — now
   // store-backed. `meta` is default-filled so every controlled input gets a
@@ -239,9 +258,15 @@ export default function AudiobookTab({ profiles = [] }) {
     setError('');
     setOutput('');
     setDone(null);
-    setProgress({ current: 0, total: 0 });
+    setStopped(false);
+    setChapters([]);
+    setAssembling(false);
     setGenerating(true);
     abortRef.current = false;
+    // A per-generation AbortController: Stop aborts it, which cancels the fetch
+    // end-to-end so the backend sees the disconnect and stops rendering (#1216).
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
       let cover_path = null;
       if (coverFile) {
@@ -250,30 +275,59 @@ export default function AudiobookTab({ profiles = [] }) {
       // Only send metadata fields the user actually filled in.
       const metadata = Object.fromEntries(Object.entries(meta).filter(([, v]) => v && v.trim()));
       const lexicon = lexDict();
-      const res = await audiobookGenerate({
-        text,
-        default_voice: defaultVoice || null,
-        format,
-        loudness: loudness === 'off' ? null : loudness,
-        cover_path,
-        metadata: Object.keys(metadata).length ? metadata : null,
-        lexicon: Object.keys(lexicon).length ? lexicon : null,
-        // language pick + expressive/quality overrides + cache opt-out (#1208).
-        // Only non-default values are emitted, so an untouched panel keeps the
-        // request byte-identical to before.
-        ...overridesToRequest(overrides, language),
-      });
+      const res = await audiobookGenerate(
+        {
+          text,
+          default_voice: defaultVoice || null,
+          format,
+          loudness: loudness === 'off' ? null : loudness,
+          cover_path,
+          metadata: Object.keys(metadata).length ? metadata : null,
+          lexicon: Object.keys(lexicon).length ? lexicon : null,
+          // language pick + expressive/quality overrides + cache opt-out (#1208).
+          // Only non-default values are emitted, so an untouched panel keeps the
+          // request byte-identical to before.
+          ...overridesToRequest(overrides, language),
+        },
+        { signal: controller.signal },
+      );
       await consumeLongformStream(
         res,
         (evt) => {
           if (evt.type === 'started') {
-            setProgress({ current: 0, total: evt.chapters });
+            // Seed the per-chapter list; chapter 0 starts rendering immediately.
+            setChapters(
+              Array.from({ length: evt.chapters }, (_, i) => ({
+                title: '',
+                status: i === 0 ? 'rendering' : 'pending',
+              })),
+            );
           } else if (evt.type === 'chapter') {
-            setProgress({ current: evt.index + 1, total: evt.total, title: evt.title });
-          } else if (evt.type === 'assembling') {
-            setProgress((p) => ({ ...p, assembling: true }));
+            // A chapter finished (cached vs freshly rendered per evt.cached); the
+            // next pending chapter becomes the one rendering.
+            setChapters((prev) =>
+              prev.map((c, j) =>
+                j === evt.index
+                  ? { ...c, title: evt.title, status: evt.cached ? 'cached' : 'done' }
+                  : j === evt.index + 1 && c.status === 'pending'
+                    ? { ...c, status: 'rendering' }
+                    : c,
+              ),
+            );
           } else if (evt.type === 'chapter_error') {
-            setProgress({ current: evt.index + 1, total: evt.total, title: evt.title });
+            setChapters((prev) =>
+              prev.map((c, j) =>
+                j === evt.index
+                  ? { ...c, title: evt.title, status: 'failed' }
+                  : j === evt.index + 1 && c.status === 'pending'
+                    ? { ...c, status: 'rendering' }
+                    : c,
+              ),
+            );
+          } else if (evt.type === 'assembling') {
+            setAssembling(true);
+          } else if (evt.type === 'stopped') {
+            setStopped(true);
           } else if (evt.type === 'done') {
             setOutput(evt.output);
             setDone({
@@ -284,17 +338,42 @@ export default function AudiobookTab({ profiles = [] }) {
             setError(evt.error || 'synthesis failed');
           }
         },
-        { isAborted: () => abortRef.current },
+        { isAborted: () => abortRef.current, signal: controller.signal },
       );
+      // consumeLongformStream returns (never throws) on a caller-initiated stop.
+      if (abortRef.current) setStopped(true);
     } catch (e) {
-      setError(e?.message || String(e));
+      // A Stop that lands before/around the first byte aborts the fetch →
+      // AbortError. Treat every self-initiated abort as "Stopped", not an error.
+      if (abortRef.current || e?.name === 'AbortError') setStopped(true);
+      else setError(e?.message || String(e));
     } finally {
       setGenerating(false);
+      setAssembling(false);
+      abortControllerRef.current = null;
     }
   }, [text, defaultVoice, format, loudness, coverFile, meta, lex, overrides, language]);
 
+  // Stop = abort the fetch (cancels the request → backend disconnect) AND flip
+  // the isAborted flag the stream consumer polls, so the read loop releases too.
+  const onStop = useCallback(() => {
+    abortRef.current = true;
+    abortControllerRef.current?.abort();
+  }, []);
+
   const busy = planLoading || generating || importing;
   const canRun = text.trim().length > 0 && !busy;
+  // Cmd/Ctrl+Enter in the editor triggers Create when runnable; a no-op while
+  // generating (canRun is false when busy).
+  const onScriptKeyDown = useCallback(
+    (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        if (canRun) onCreate();
+      }
+    },
+    [canRun, onCreate],
+  );
 
   return (
     <div className="audiobook-tab flex flex-col h-full box-border px-[1.5rem] py-[1.25rem] gap-[12px]">
@@ -343,9 +422,15 @@ export default function AudiobookTab({ profiles = [] }) {
             {planLoading ? <Loader size={14} className="spin" /> : null}{' '}
             {t('audiobook.preview_plan')}
           </Button>
-          <Button variant="primary" onClick={onCreate} disabled={!canRun}>
-            {generating ? <Loader size={14} className="spin" /> : null} {t('audiobook.create')}
-          </Button>
+          {generating ? (
+            <Button variant="danger" onClick={onStop}>
+              <Square size={14} /> {t('audiobook.stop')}
+            </Button>
+          ) : (
+            <Button variant="primary" onClick={onCreate} disabled={!canRun}>
+              {t('audiobook.create')}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -357,9 +442,15 @@ export default function AudiobookTab({ profiles = [] }) {
             className="input-base"
             value={text}
             onChange={(e) => setText(e.target.value)}
+            onKeyDown={onScriptKeyDown}
             placeholder={t('audiobook.script_placeholder')}
             aria-label={t('audiobook.script')}
           />
+          {!text.trim() && (
+            <p className="muted text-[var(--text-sm)] text-fg-muted m-0">
+              {t('audiobook.empty_hint')}
+            </p>
+          )}
         </div>
 
         {/* Right: settings + results, scrolls independently */}
@@ -460,82 +551,24 @@ export default function AudiobookTab({ profiles = [] }) {
             </div>
           )}
 
-          {generating && progress && (
-            <div className="audiobook-progress" role="status" aria-live="polite">
-              {progress.assembling
-                ? t('audiobook.assembling')
-                : t('audiobook.synthesizing', {
-                    current: progress.current,
-                    total: progress.total,
-                    title: progress.title || '',
-                  })}
+          {generating && <GenerationProgress t={t} chapters={chapters} assembling={assembling} />}
+
+          {stopped && !generating && (
+            <div className="audiobook-progress" role="status">
+              {t('audiobook.stopped_note')}
             </div>
           )}
 
-          {output && (
-            <div className="audiobook-done">
-              <div style={{ marginBottom: 8 }}>✅ {t('audiobook.ready')}</div>
-              {done && done.failed_chapters.length > 0 && (
-                <div className="muted" style={{ marginBottom: 8 }}>
-                  {t('audiobook.failed_note', { count: done.failed_chapters.length })}
-                </div>
-              )}
-              {done && done.cached_chapters > 0 && (
-                <div className="muted" style={{ marginBottom: 8 }}>
-                  {t('audiobook.cached_note', { count: done.cached_chapters })}
-                </div>
-              )}
-              <audio controls src={audioUrl(output)} style={{ width: '100%' }} />
-              <div style={{ marginTop: 8 }}>
-                <a
-                  className={buttonVariants({ variant: 'subtle', size: 'omniMd' })}
-                  href={audioUrl(output)}
-                  download={output}
-                >
-                  <Download size={14} /> {t('audiobook.download')}
-                </a>
-              </div>
-            </div>
-          )}
+          {output && <AudiobookResult t={t} output={output} done={done} />}
 
           {plan && (
-            <div className="audiobook-plan">
-              <h3>{t('audiobook.plan_heading', { count: plan.chapter_count })}</h3>
-              <ol style={{ paddingLeft: 18, margin: 0 }}>
-                {plan.chapters.map((c, i) => {
-                  const prev = chapterPrev[i] || {};
-                  return (
-                    <li key={i} style={{ marginBottom: 8 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <Button
-                          variant="icon"
-                          iconSize="sm"
-                          onClick={() => onPreviewChapter(i)}
-                          disabled={prev.loading || busy}
-                          aria-label={t('audiobook.preview_chapter', { title: c.title })}
-                        >
-                          {prev.loading ? (
-                            <Loader size={12} className="spin" />
-                          ) : (
-                            <Play size={12} />
-                          )}
-                        </Button>
-                        <strong>{c.title}</strong>{' '}
-                        <span className="muted">
-                          {t('audiobook.chapter_meta', {
-                            spans: c.spans.length,
-                            chars: c.char_count,
-                          })}
-                        </span>
-                      </div>
-                      {prev.url && (
-                        <audio controls src={prev.url} style={{ width: '100%', marginTop: 4 }} />
-                      )}
-                    </li>
-                  );
-                })}
-              </ol>
-            </div>
+            <PlanList
+              t={t}
+              plan={plan}
+              chapterPrev={chapterPrev}
+              onPreviewChapter={onPreviewChapter}
+              busy={busy}
+            />
           )}
         </div>
       </div>

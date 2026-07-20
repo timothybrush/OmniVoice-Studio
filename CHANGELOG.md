@@ -28,6 +28,7 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
 ### Added
 
+- Audiobook tab: a **Stop** button that truly cancels a running generation (not just the UI) and live per-chapter progress — a bar, elapsed + ETA, and each chapter's status (rendering / done / cached / failed); finished chapters stay cached so Create again resumes. `Cmd/Ctrl+Enter` starts a render (#1216)
 - Settings → Permissions + wizard System Check: live mic/Accessibility grant state, per-OS guidance, Open Settings deep-links; dictation pre-flights the mic grant (#1175)
 - `parakeet-mlx` engine: Parakeet TDT v3 on Apple Silicon — 25 EU languages, word timestamps, ~2 GB, opt-in from Settings → Models, never auto-downloads (#1175)
 - First-run downloads race the direct GitHub path against the mirror and use whichever answers fastest (#1179)

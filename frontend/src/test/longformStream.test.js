@@ -65,4 +65,66 @@ describe('consumeLongformStream', () => {
   it('throws when the response has no body', async () => {
     await expect(consumeLongformStream({}, () => {})).rejects.toThrow(/no response stream/);
   });
+
+  // #1216 — a real Stop must release the stream, not just break the read loop:
+  // reader.cancel() closes the fetch so the backend sees the disconnect.
+  it('cancels the reader when an AbortSignal is already aborted', async () => {
+    let cancelled = false;
+    const res = {
+      body: {
+        getReader: () => ({
+          read: () => Promise.resolve({ done: true, value: undefined }),
+          cancel: () => {
+            cancelled = true;
+            return Promise.resolve();
+          },
+        }),
+      },
+    };
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const events = [];
+    await consumeLongformStream(res, (e) => events.push(e), { signal: ctrl.signal });
+    expect(cancelled).toBe(true);
+    expect(events).toEqual([]); // never read a byte
+  });
+
+  it('swallows an abort-rejected read and cancels the reader when the signal fires mid-read', async () => {
+    const ctrl = new AbortController();
+    let cancelled = false;
+    let n = 0;
+    const res = {
+      body: {
+        getReader: () => ({
+          read: () => {
+            n += 1;
+            if (n === 1)
+              return Promise.resolve({
+                done: false,
+                value: new TextEncoder().encode(sse({ type: 'started', chapters: 3 })),
+              });
+            // 2nd read stays pending until the signal aborts, then rejects like
+            // a real fetch body does on AbortController.abort().
+            return new Promise((_, reject) => {
+              ctrl.signal.addEventListener('abort', () =>
+                reject(new DOMException('Aborted', 'AbortError')),
+              );
+            });
+          },
+          cancel: () => {
+            cancelled = true;
+            return Promise.resolve();
+          },
+        }),
+      },
+    };
+    const events = [];
+    const p = consumeLongformStream(res, (e) => events.push(e), { signal: ctrl.signal });
+    // Let the first read + 'started' event flush, then Stop.
+    await Promise.resolve();
+    ctrl.abort();
+    await expect(p).resolves.toBeUndefined(); // abort is NOT an error
+    expect(events.map((e) => e.type)).toEqual(['started']);
+    expect(cancelled).toBe(true);
+  });
 });

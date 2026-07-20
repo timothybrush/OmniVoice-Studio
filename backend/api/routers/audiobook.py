@@ -27,7 +27,9 @@ import os
 import re
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from collections.abc import Awaitable, Callable
+
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -670,6 +672,7 @@ async def _render_longform_sse(
     job_type: str = "audiobook",
     job_id: str | None = None,
     resume: bool = False,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
 ):
     """Shared chapterized-render SSE generator for Audiobook *and* Stories.
 
@@ -766,9 +769,29 @@ async def _render_longform_sse(
         chapters_meta: list[tuple[str, int]] = []
         cached_n = 0
         failed: list[int] = []
+        interrupted = False
         yield _emit({"type": "started", "job_id": job_id, "chapters": total})
 
         for i, chapter in enumerate(plan.chapters):
+            # Client-disconnect cancellation (#1216): if the browser aborted the
+            # request (the user hit Stop), stop scheduling further chapters
+            # instead of rendering the whole book into a stream nobody reads.
+            # Checked at the chapter boundary so a stop is clean and the finished
+            # chapters — content-addressed in the shared cache — plus the resume
+            # manifest are left in place, so a later Create/resume finishes the
+            # rest cheaply. (Starlette also cancels this task on disconnect; the
+            # explicit poll makes the stop deterministic and lets us emit a clean
+            # terminal `stopped` event. This render parks no model on CPU the way
+            # the dub transcribe does — #1191 — so there is no restore debt to
+            # pay on exit; stopping is simply "schedule no more chapters".)
+            if is_disconnected is not None:
+                try:
+                    gone = await is_disconnected()
+                except Exception:
+                    gone = False
+                if gone:
+                    interrupted = True
+                    break
             try:
                 wav_path, dur, was_cached, seg_stats = await loop.run_in_executor(
                     _gpu_pool, _render_chapter_cached,
@@ -794,6 +817,27 @@ async def _render_longform_sse(
                 ev["segments"] = seg_stats["total"]
                 ev["cached_segments"] = seg_stats["cached"]
             yield _emit(ev)
+
+        if interrupted:
+            logger.info("[%s] client disconnected — stopped after %d/%d chapters",
+                        job_id, len(chapter_files), total)
+            if job_store is not None:
+                try:
+                    # A client disconnect here is a user-initiated Stop, not a
+                    # failure — record it as cancelled so job history reads right
+                    # and the resumable state isn't mistaken for a broken render.
+                    job_store.mark_cancelled(job_id)
+                except Exception:
+                    pass  # best-effort job history
+            # Deliberately DO NOT clear the resume manifest: the rendered chapters
+            # are cached, so Create-again / resume picks up where this left off.
+            # Emit a terminal `stopped` event (a fully-disconnected client won't
+            # receive it, but a same-origin proxy or a partial read still gets a
+            # clean close instead of a dangling stream).
+            yield _emit({"type": "stopped", "rendered": len(chapter_files),
+                         "total": total, "cached_chapters": cached_n,
+                         "failed_chapters": failed})
+            return
 
         if not chapter_files:
             yield _emit({"type": "error", "error": "all chapters failed to render"})
@@ -865,15 +909,19 @@ async def _render_longform_sse(
 
 
 @router.post("/audiobook")
-async def audiobook_synthesize(req: AudiobookRequest):
+async def audiobook_synthesize(req: AudiobookRequest, request: Request = None):
     """Synthesize a chapterized audiobook from a script, streaming SSE progress."""
     plan = parse_audiobook_script(req.text, default_voice=req.default_voice)
+    # `request` is injected by FastAPI on the HTTP path (the default only applies
+    # to a direct in-process call, e.g. a unit test); its disconnect poll is what
+    # lets Stop cancel the render mid-book (#1216).
     return StreamingResponse(
         _render_longform_sse(
             plan, default_voice=req.default_voice, language=req.language,
             fmt=req.format, bitrate=req.bitrate,
             loudness=req.loudness, cover_path=req.cover_path, metadata=req.metadata,
             lexicon=req.lexicon, opts=_expressive_opts(req), job_type="audiobook",
+            is_disconnected=request.is_disconnected if request is not None else None,
         ),
         media_type="text/event-stream",
     )
@@ -906,7 +954,7 @@ class LongformRenderRequest(ExpressiveMixin):
 
 
 @router.post("/longform/render")
-async def longform_render(req: LongformRenderRequest):
+async def longform_render(req: LongformRenderRequest, request: Request = None):
     """Render a pre-built chapter/span plan (the Stories Editor's compiled
     cast+lines) through the shared chapterized renderer — same resume, loudness,
     cover, metadata, and output formats as the Audiobook job."""
@@ -931,6 +979,7 @@ async def longform_render(req: LongformRenderRequest):
             fmt=req.format, bitrate=req.bitrate,
             loudness=req.loudness, cover_path=req.cover_path, metadata=req.metadata,
             lexicon=req.lexicon, opts=_expressive_opts(req), job_type="story",
+            is_disconnected=request.is_disconnected if request is not None else None,
         ),
         media_type="text/event-stream",
     )
@@ -981,7 +1030,7 @@ def list_resumable_jobs() -> dict:
 
 
 @router.post("/audiobook/resume/{job_id}")
-async def resume_longform(job_id: str):
+async def resume_longform(job_id: str, request: Request = None):
     """Resume an interrupted longform render from its persisted manifest. The
     already-rendered chapters are content-addressed in the shared cache, so they
     return instantly — only the unrendered chapters synthesize again. Streams the
@@ -1024,6 +1073,7 @@ async def resume_longform(job_id: str):
             metadata=p.get("metadata"), lexicon=p.get("lexicon"),
             opts=ExpressiveOptions.from_manifest(p.get("expressive")),
             job_type=entry["job_type"],
+            is_disconnected=request.is_disconnected if request is not None else None,
         ),
         media_type="text/event-stream",
     )

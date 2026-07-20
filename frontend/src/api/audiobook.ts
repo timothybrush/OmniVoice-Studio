@@ -102,12 +102,21 @@ export interface AudiobookGenerateBody extends ExpressiveRequestFields {
  * Start the synth job. Returns the raw streaming Response; the caller reads
  * `response.body` with a reader + the sseParse helpers. (apiFetch throws on a
  * non-2xx status, so a returned Response is always a live stream.)
+ *
+ * `opts.signal` wires an AbortController into the fetch so a Stop cancels the
+ * request end-to-end (#1216): aborting closes the connection, the backend's
+ * `is_disconnected()` poll trips, and it stops scheduling further chapters
+ * instead of rendering the whole book into a stream nobody is reading.
  */
-export async function audiobookGenerate(body: AudiobookGenerateBody): Promise<Response> {
+export async function audiobookGenerate(
+  body: AudiobookGenerateBody,
+  opts: { signal?: AbortSignal } = {},
+): Promise<Response> {
   return apiFetch('/audiobook', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: opts.signal,
   });
 }
 
