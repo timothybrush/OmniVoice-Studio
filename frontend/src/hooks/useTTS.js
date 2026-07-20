@@ -257,6 +257,18 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
           streamed = true;
         } catch (err) {
           if (!(err instanceof StreamingPreviewError)) throw err;
+          // #1190: a RETRYABLE mid-stream failure (GPU timeout / saturated
+          // pool) must not trigger the classic re-render. The backend already
+          // spent the full budget on this text, and the abandoned job keeps
+          // holding the device until it drains — re-synthesizing the whole
+          // text right now makes the user wait out a second timeout to see the
+          // same error. Surface the backend's actionable message instead.
+          // Non-retryable failures (transport drop, Web Audio glitch) keep the
+          // classic fallback: there the whole-file path genuinely can succeed.
+          if (err.retryable) {
+            addBreadcrumb('generate:stream-retryable-abort');
+            throw err;
+          }
           console.warn(
             'Streaming preview failed mid-stream; falling back to the classic generate:',
             err?.message || err,

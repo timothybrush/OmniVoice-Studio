@@ -17,6 +17,7 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 - No silent multi-GB downloads anywhere — explicit, one-click prompts instead
 - Windows: custom install drives honored, no console-window storms, no black-screen boot
 - Quiet recordings clone; broken engine deps repair-hint and fall back
+- Queued and long generations stop failing with a bogus "too heavy for your hardware"
 - First-run analytics consent, Colab notebook, ROCm Docker image, trusted-network CIDRs
 
 ### Changed
@@ -50,6 +51,13 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
 ### Fixed
 
+- A generation queued behind a busy one no longer spends its timeout waiting: the budget starts when a GPU worker picks the job up, so a queued request can't be failed as "too heavy for the available compute" without having run (#1190)
+- One request's timeout no longer cancels unrelated jobs already waiting in the GPU queue (#1190)
+- Timeout messages stopped claiming capacity was restored automatically — the abandoned job keeps the device until it finishes, and the guidance now says to let it drain (#1190)
+- The length-scaled generate budget now covers every path — streaming previews, batch dubbing, `/v1/audio/speech`, dub and archetype previews — instead of only the two classic call sites, so long inputs stop failing at a flat 300s (#1190)
+- Provenance watermarking moved off the GPU worker pool: on 1-worker machines each embed was serializing ahead of the next generation (#1190)
+- A batch segment that times out fails the job with a reason instead of shipping a finished-looking dub with silent gaps (#1190)
+- `/v1/audio/speech` refuses work up front with 429 + `Retry-After` when the pool is saturated, and returns a retryable 503 rather than a 500 on timeout (#1190)
 - Subtitle parsing no longer stalls on a blank-line-heavy `.srt`: the timing-line regex backtracked across newlines, so a mis-saved export could pin an import for hours (#1203)
 - A broken ASR engine's fallback could silently auto-download multi-GB weights — every fallback now passes the same no-download preflight and shows the download CTA instead (#1189)
 - Dub transcription releases the ASR model from VRAM on every exit — crashes, early errors, and client disconnects included (#1175)

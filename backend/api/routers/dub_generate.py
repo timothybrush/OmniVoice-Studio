@@ -805,12 +805,16 @@ async def dub_generate(job_id: str, req: DubRequest):
 
                 # Bounded + pool-reset on hang so a wedged dub segment can't
                 # starve the GPU pool and brick the backend (#730 class).
+                # Budget from the shared length-scaled helper (#1190): a long
+                # dub segment used to die on the flat 300s even after v0.3.22.
+                from services.model_manager import generate_timeout_s
                 audio_tensor = await run_on_gpu_pool_guarded(
                     lambda: _gen(
                         seg.text, seg_lang, seg_instruct, _dur_for_tts,
                         _num_step, req.guidance_scale, seg_speed, seg_profile, seg_effect_preset,
                     ),
                     what="Dub generate",
+                    timeout=generate_timeout_s(seg.text),
                 )
                 _t_tts += time.perf_counter() - _t_tts_0
 
@@ -1498,8 +1502,12 @@ async def preview_segment(job_id: str, req: SegmentPreviewRequest):
                               context="dub_generate.preview_segment")
 
     # Bounded + pool-reset on hang so a wedged preview generate can't starve the
-    # GPU pool and brick the backend (#730 class).
-    audio_tensor = await run_on_gpu_pool_guarded(_gen, what="Dub preview generate")
+    # GPU pool and brick the backend (#730 class). Length-scaled budget (#1190).
+    from services.model_manager import generate_timeout_s
+    audio_tensor = await run_on_gpu_pool_guarded(
+        _gen, what="Dub preview generate",
+        timeout=generate_timeout_s(req.text),
+    )
 
     sr = backend.sample_rate
     buf = io.BytesIO()

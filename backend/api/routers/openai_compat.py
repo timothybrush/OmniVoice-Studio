@@ -257,6 +257,12 @@ def _typed_speech_http_error(e: Exception) -> Optional[HTTPException]:
     - InvalidBinaryError (managed engine binary is a placeholder / corrupt /
       refused by the OS) → 503 with the repair hint, instead of the bare
       "[Errno 8] Exec format error" 500.
+    - TimeoutError (#1190/#1202: pool saturation or a job that overran its
+      execution budget) → 503 + Retry-After + X-OmniVoice-Retryable, instead of
+      the 500 a scripted client can't distinguish from a real crash. Matched on
+      the BUILTIN base, not GpuJobTimeoutError by name, so a mid-suite module
+      reload can't break the isinstance check (same rationale as the load-path
+      catch below).
     Returns None for anything else (caller falls through to the generic 500).
     """
     from services.binary_preflight import InvalidBinaryError
@@ -266,6 +272,12 @@ def _typed_speech_http_error(e: Exception) -> Optional[HTTPException]:
         return HTTPException(status_code=400, detail=str(e))
     if isinstance(e, InvalidBinaryError):
         return HTTPException(status_code=503, detail=str(e))
+    if isinstance(e, TimeoutError):
+        return HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": str(getattr(e, "retry_after", 30)),
+                     "X-OmniVoice-Retryable": "true"},
+        )
     return None
 
 
@@ -410,11 +422,32 @@ async def create_speech(req: SpeechRequest):
         logger.warning("OpenAI TTS engine load failed: %s", e)
         raise http from e
 
+    # Admission control at SUBMIT (#1190/#1202). This is the scripted-client
+    # surface: a script fanning out N requests at a 1-worker pool used to get N
+    # silent multi-minute waits and then "too heavy for the available compute".
+    # Refusing up front with 429 + Retry-After lets a client back off correctly,
+    # and costs an interactive user nothing (the policy only trips when a full
+    # wave of jobs is ALREADY queued — see check_gpu_admission).
+    from services.model_manager import check_gpu_admission
+    try:
+        check_gpu_admission(what="OpenAI TTS generate")
+    except TimeoutError as e:
+        logger.warning("OpenAI TTS refused — GPU pool saturated: %s", e)
+        raise HTTPException(
+            status_code=429, detail=str(e),
+            headers={"Retry-After": str(getattr(e, "retry_after", 30)),
+                     "X-OmniVoice-Retryable": "true"},
+        ) from e
+
     try:
         # Bounded + pool-reset on hang so a wedged TTS request can't starve the
-        # GPU pool and brick the backend (#730 class).
+        # GPU pool and brick the backend (#730 class). The budget is the shared
+        # length-scaled one (#1190) — this route used to hardcode the flat 300s,
+        # so long inputs failed here even after v0.3.22 shipped the scaling.
+        from services.model_manager import generate_timeout_s
         wav, sr = await run_on_gpu_pool_guarded(
-            lambda: _run_tts(backend, text, kw), what="OpenAI TTS generate")
+            lambda: _run_tts(backend, text, kw), what="OpenAI TTS generate",
+            timeout=generate_timeout_s(text))
     except Exception as e:
         # #1172/#1173: typed failures get their real status + actionable
         # message (400 bad input / 503 broken engine binary) instead of a

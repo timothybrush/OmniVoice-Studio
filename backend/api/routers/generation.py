@@ -20,6 +20,7 @@ from core.config import OUTPUTS_DIR, VOICES_DIR
 import functools
 from services.model_manager import (
     get_model, _gpu_pool, run_on_gpu_pool_guarded, GpuJobTimeoutError,
+    GpuPoolBusyError,
 )
 from services.audio_io import _safe_torchaudio_save
 from services.binary_preflight import InvalidBinaryError
@@ -443,17 +444,13 @@ def _oom_friendly_reraise(e):
 def _generate_timeout_s(text: str) -> float:
     """Wall-clock budget for one generate, scaled to the request.
 
-    The fixed OMNIVOICE_GENERATE_TIMEOUT_S (300s) was sized for typical
-    requests on a GPU — a legitimately long text on a slow CPU box times out
-    with the exact user-facing 503 the audit flagged as a recurring class
-    (#1033/#1037 wave), and the remedy was "go set an env var". Scale the
-    budget with input size instead: the floor stays the configured value, and
-    long inputs get 1 extra second per 40 characters — generous enough for
-    CPU-class hardware, still bounded (a wedged job is caught in minutes, not
-    hours). An explicit OMNIVOICE_GENERATE_TIMEOUT_S remains the floor/knob.
+    Thin alias for the canonical helper, which moved to
+    ``services.model_manager.generate_timeout_s`` (#1190) so /v1/audio/speech,
+    batch, dub and archetype previews share it instead of each re-deriving (or,
+    as they did, silently keeping the flat 300s).
     """
-    from services.model_manager import GPU_JOB_TIMEOUT_S
-    return max(GPU_JOB_TIMEOUT_S, GPU_JOB_TIMEOUT_S + (max(0, len(text or "") - 1200) / 40.0))
+    from services.model_manager import generate_timeout_s
+    return generate_timeout_s(text)
 
 
 def _run_inference(
@@ -658,9 +655,13 @@ async def _finalize_generation(
     # producers now share the mark_synthetic chokepoint. It self-gates on the
     # user's watermark setting + AudioSeal availability and passes the audio
     # through unchanged on any failure, so it never breaks generation.
+    # Dispatched to the dedicated watermark pool, not the GPU pool (#1190):
+    # AudioSeal embedding is CPU work that holds no VRAM, so occupying a GPU
+    # worker with it only delays the next generate on 1-worker hosts.
     from services.watermark import mark_synthetic
+    from services.model_manager import get_watermark_pool
     audio_tensor = await loop.run_in_executor(
-        _gpu_pool,
+        get_watermark_pool(),
         functools.partial(mark_synthetic, audio_tensor, sample_rate,
                           context="generate.finalize"),
     )
@@ -1015,8 +1016,14 @@ async def generate_speech(
             ref_text = await run_on_gpu_pool_guarded(
                 functools.partial(transcribe_reference, ref_audio_path),
                 what="Reference transcribe",
+                # Floor budget (#1190): a reference clip is seconds of audio,
+                # so the length-scaled bonus never applies — but the timeout is
+                # explicit here too, so no dispatch relies on a hidden default.
+                timeout=_generate_timeout_s(""),
             )
-        except GpuJobTimeoutError as e:
+        # TimeoutError covers both the execution bound and pool saturation:
+        # this path is best-effort either way.
+        except TimeoutError as e:
             logger.warning("reference transcribe hung (%s); using model ASR fallback", e)
             ref_text = None
         # #1032: cache the transcript onto its clone profile so the ASR model
@@ -1140,14 +1147,15 @@ async def generate_speech(
                     sr = _model.sampling_rate if hasattr(_model, "sampling_rate") else 24000
                     skip = False
                 preview = _apply_effect_chain(raw, sr, effect_preset, skip_mastering=skip)
-                # Provenance-mark the STREAMED copy only (#1169): the preview
-                # PCM leaves the app the moment it's yielded, before
+                # The STREAMED copy is provenance-marked by the caller (#1169
+                # mark, moved off this GPU job in #1190): the preview PCM
+                # leaves the app the moment it's yielded, before
                 # _finalize_generation marks the assembled take, so it needs
-                # its own mark. `raw` stays unmarked — the saved artifact gets
-                # exactly one whole-take mark in the finalize path (no
-                # double-embed on the file users keep).
-                from services.watermark import mark_synthetic
-                preview = mark_synthetic(preview, sr, context="generate.stream_preview")
+                # its own mark — but AudioSeal embedding is CPU work, and
+                # doing it here held the GPU worker for the whole embed on
+                # every one of N chunks. `raw` stays unmarked — the saved
+                # artifact gets exactly one whole-take mark in the finalize
+                # path (no double-embed on the file users keep).
                 return raw, preview, sr
             except ValueError:
                 raise
@@ -1187,6 +1195,7 @@ async def generate_speech(
                                 max_chunk_chars, crossfade_ms,
                             ),
                             what="TTS generate",
+                            timeout=_generate_timeout_s(text),
                         )
                         sample_rate = _backend.sample_rate
                     else:
@@ -1201,6 +1210,7 @@ async def generate_speech(
                                 max_chunk_chars, crossfade_ms,
                             ),
                             what="TTS generate",
+                            timeout=_generate_timeout_s(text),
                         )
                         sample_rate = _model.sampling_rate
                     yield _line({
@@ -1213,9 +1223,14 @@ async def generate_speech(
                     # the saved take. Marking a copy keeps the artifact's
                     # single whole-take mark (embed_watermark returns a new
                     # tensor; audio_tensor itself is untouched).
+                    # Runs on the dedicated watermark pool, not the GPU pool
+                    # (#1190): AudioSeal embedding is CPU work that owns no
+                    # VRAM, and on a 1-worker host it used to serialize
+                    # directly ahead of the next generate.
                     from services.watermark import mark_synthetic
+                    from services.model_manager import get_watermark_pool
                     _preview = await asyncio.get_running_loop().run_in_executor(
-                        _gpu_pool,
+                        get_watermark_pool(),
                         functools.partial(mark_synthetic, audio_tensor, sample_rate,
                                           context="generate.stream_preview"),
                     )
@@ -1229,8 +1244,22 @@ async def generate_speech(
                         raw, preview, sample_rate = await run_on_gpu_pool_guarded(
                             functools.partial(_render_stream_chunk, i, chunk_text),
                             what="TTS generate",
+                            # Budget scaled to THIS chunk (#1190) — the flat
+                            # 300s here is what made long streamed renders fail
+                            # even after the v0.3.22 scaled budget shipped.
+                            timeout=_generate_timeout_s(chunk_text),
                         )
                         parts.append(raw)
+                        # Provenance-mark the streamed copy off the GPU pool
+                        # (#1169 mark, #1190 placement): CPU-only AudioSeal
+                        # work must not occupy a GPU worker between chunks.
+                        from services.watermark import mark_synthetic
+                        from services.model_manager import get_watermark_pool
+                        preview = await asyncio.get_running_loop().run_in_executor(
+                            get_watermark_pool(),
+                            functools.partial(mark_synthetic, preview, sample_rate,
+                                              context="generate.stream_preview"),
+                        )
                         if i == 0:
                             # After the first render so lazy-loading engines
                             # report their REAL sample rate (see /ws/tts).
@@ -1244,6 +1273,7 @@ async def generate_speech(
                     audio_tensor = await run_on_gpu_pool_guarded(
                         functools.partial(_assemble_stream_chunks, parts, sample_rate),
                         what="TTS assemble",
+                        timeout=_generate_timeout_s(text),
                     )
 
                 _, meta = await _finalize_generation(
@@ -1261,9 +1291,15 @@ async def generate_speech(
                 # Client went away mid-stream — same semantics as aborting a
                 # classic /generate mid-render: nothing is saved.
                 raise
-            except GpuJobTimeoutError as e:
+            except (GpuJobTimeoutError, GpuPoolBusyError) as e:
+                # In-band error frame carries the machine-readable retryable
+                # marker (#1190) — an NDJSON consumer can back off instead of
+                # guessing from the prose.
                 logger.error("Streaming generate timed out: %s", e)
-                yield _line({"type": "error", "detail": str(e)})
+                yield _line({
+                    "type": "error", "detail": str(e), "retryable": True,
+                    "retry_after": getattr(e, "retry_after", 30),
+                })
             except ValueError as e:
                 logger.error("Streaming generate validation failed: %s", e)
                 yield _line({"type": "error", "detail": str(e)})
@@ -1373,12 +1409,25 @@ async def generate_speech(
         )
     except HTTPException:
         raise
+    except GpuPoolBusyError as e:
+        # Saturation, not failure (#1190): the job never started, so the caller
+        # can retry the identical request. Retry-After + the retryable marker
+        # make that machine-readable for scripted clients.
+        logger.warning("Generate refused — GPU pool saturated: %s", e)
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": str(e.retry_after),
+                     "X-OmniVoice-Retryable": "true"},
+        ) from e
     except GpuJobTimeoutError as e:
-        # A wedged GPU generate — the pool was already reset to restore capacity
-        # (#730 class). Report the actionable timeout instead of the misleading
-        # "can't reach backend" the frontend shows when the pool starves.
+        # A generate that really ran and overran its budget (#730 class). The
+        # abandoned worker still holds the device until it drains — the message
+        # says so, and Retry-After spaces the retry out accordingly.
         logger.error("Generate timed out: %s", e)
-        raise HTTPException(status_code=503, detail=str(e)) from e
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30", "X-OmniVoice-Retryable": "true"},
+        ) from e
     except InvalidBinaryError as e:
         # #1172 class: a managed engine binary is a placeholder / corrupt /
         # refused by the OS. The message carries the repair hint — surface it

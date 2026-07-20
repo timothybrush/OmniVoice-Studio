@@ -334,12 +334,27 @@ async def _run_batch_pipeline(job_id: str, job: dict):
                     return normalize_audio(audio_out, target_dBFS=-2.0)
                 except Exception as e:
                     logger.warning("TTS failed for seg %d (lang=%s): %s", i, lang, e)
+                    # #1190: the silence still stands in for the segment (one
+                    # bad line shouldn't bin an otherwise good dub), but it is
+                    # no longer INVISIBLE — the job carries a warning the UI /
+                    # API consumer can see instead of shipping a
+                    # finished-looking track with unexplained silence.
+                    job.setdefault("warnings", []).append(
+                        f"Segment {i + 1} of the {lang} track failed to "
+                        f"synthesize and was left silent: {e}"
+                    )
                     return torch.zeros(1, int(dur * sr))
 
             try:
                 # Bounded + pool-reset on hang so a wedged batch segment can't
                 # starve the GPU pool and brick the backend (#730 class).
-                audio_tensor = await run_on_gpu_pool_guarded(_gen, what="Batch generate")
+                # Budget is the shared length-scaled one (#1190): a long segment
+                # on CPU-class hardware no longer dies on the flat 300s.
+                from services.model_manager import generate_timeout_s
+                audio_tensor = await run_on_gpu_pool_guarded(
+                    _gen, what="Batch generate",
+                    timeout=generate_timeout_s(seg_text),
+                )
 
                 # Fit to slot
                 target_samples_seg = int(seg_duration * sr)
@@ -364,8 +379,28 @@ async def _run_batch_pipeline(job_id: str, job: dict):
                 e_idx = min(s_idx + wl, total_samples)
                 full_audio[:, s_idx:e_idx] += audio_tensor[:, :e_idx - s_idx]
 
+            except TimeoutError as e:
+                # #1190/#1202: a GPU timeout (or a saturated pool) used to be
+                # swallowed into a silent gap in the dubbed track — the user got
+                # a finished-looking video with missing speech and no warning,
+                # and on a 1-worker host the abandoned job made every later
+                # segment likelier to time out too (the "22-chunk batch dies at
+                # chunk 3" cascade). Fail the job loudly instead: _worker()'s
+                # except-Exception handler records a structured failure the UI
+                # surfaces. Non-timeout per-segment errors keep the old
+                # degrade-to-gap behaviour, but are now recorded on the job.
+                logger.error("Batch TTS seg %d timed out — failing the job: %s", i, e)
+                raise RuntimeError(
+                    f"Segment {i + 1} of the {target_lang} track did not "
+                    f"render, so the dubbed track would have shipped with a "
+                    f"silent gap. {e}"
+                ) from e
             except Exception as e:
                 logger.warning("Batch TTS seg %d failed: %s", i, e)
+                job.setdefault("warnings", []).append(
+                    f"Segment {i + 1} of the {target_lang} track failed and was "
+                    f"left silent: {e}"
+                )
 
         # ── 3c. Save dubbed audio track ───────────────────────────────
         # Invisible provenance mark on the assembled track (#1169), tensor
@@ -375,10 +410,15 @@ async def _run_batch_pipeline(job_id: str, job: dict):
         # dub_generate's per-segment marks: the 16-bit message repeats
         # throughout. Runs in the GPU pool like generate's finalize; never
         # raises (degrades to unmarked on failure, same as every producer).
+        # Dispatched to the dedicated watermark pool, not the GPU pool (#1190):
+        # AudioSeal embedding is CPU work that holds no VRAM, and a whole-track
+        # embed is long enough that occupying a GPU worker with it stalled the
+        # next language's segments on 1-worker hosts.
         from services.watermark import mark_synthetic
+        from services.model_manager import get_watermark_pool
         import functools
         full_audio = await loop.run_in_executor(
-            _gpu_pool,
+            get_watermark_pool(),
             functools.partial(mark_synthetic, full_audio, sr,
                               context="batch.dub_track"),
         )
