@@ -24,6 +24,7 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
 - Settings → Models: grouped catalog (TTS / ASR / Dictation / Diarisation), "recommended for this machine" chips, incompatible models collapsed behind a toggle
 - Only the TTS model (~2.4 GB) is required on first run; ASR picks are curated per platform via `curated_on` in `models.yaml` (MLX on Apple Silicon, CT2+Turbo on CUDA, PyTorch on ROCm, int8 on CPU)
+- Audiobook tab tidied up: the settings column is now grouped into compact collapsible sections (Output / Book details / Pronunciation / Markup), so script + voice + Create sit up top instead of a long scroll — same controls, denser layout (#1214)
 
 ### Added
 
