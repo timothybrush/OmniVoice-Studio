@@ -354,27 +354,38 @@ Professional-grade voice AI, minus the subscription and the cloud.
 
 ## 🔌 OpenAI-compatible API
 
-Already have a script, agent, or tool that speaks OpenAI's audio API? Point it at `http://localhost:3900/v1` — no key needed, no code changes. The backend ships a drop-in surface for the audio endpoints, wired to whichever TTS/ASR engine you have active (and yes, `voice` accepts your cloned voice-profile IDs).
+Point any tool that speaks OpenAI's audio API at `http://localhost:3900/v1` — **no key, no code changes.** Swap the base URL and your existing scripts, agents, and OpenAI/ElevenLabs SDK calls run locally on whatever engine you have active. What the cloud can't do: `voice` takes **your own cloned-voice profile IDs**, and `model` can pin a **specific engine** per request.
 
 | Endpoint | What it does |
 |---|---|
-| `POST /v1/audio/speech` | TTS — text in; `mp3` / `wav` / `flac` / `opus` / `pcm` out. `tts-1` / `tts-1-hd` map to your active engine; OpenAI voice names (`alloy`, …) are accepted. |
-| `POST /v1/audio/transcriptions` | STT — audio file in; `json`, `text`, `verbose_json`, `srt`, or `vtt` out. `whisper-1` maps to your active ASR engine. |
+| `POST /v1/audio/speech` | TTS — text in; `mp3` / `opus` / `aac` / `flac` / `wav` / `pcm` out. `model`: `tts-1`/`tts-1-hd` (active engine) or a specific one (`voxcpm2`, `cosyvoice`, `kittentts`, …). `voice`: a cloned profile ID, `default`, or an OpenAI name (`alloy`, …). `speed` supported. |
+| `POST /v1/audio/transcriptions` | STT — audio file in; `json` / `text` / `verbose_json` / `srt` / `vtt` out (`verbose_json` adds word-level timings). `whisper-1` maps to your active ASR engine. |
 | `GET /v1/audio/voices` | OmniVoice extension — lists every voice profile and engine, so clients can discover your clones. |
 
+**Speak with your own cloned voice** — list the IDs, then pass one as `voice`:
+
 ```sh
+# 1 — find a cloned voice's profile ID
+curl -s http://localhost:3900/v1/audio/voices | jq '.voices[] | select(.type=="profile") | {voice_id, name}'
+
+# 2 — synthesize with it
 curl http://localhost:3900/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model": "tts-1", "voice": "alloy", "input": "Generated on my own hardware.", "response_format": "wav"}' \
+  -d '{"model":"tts-1","voice":"<profile-id>","input":"Made on my own hardware.","response_format":"wav"}' \
   --output speech.wav
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:3900/v1", api_key="none")  # any string works — nothing checks it
+client = OpenAI(base_url="http://localhost:3900/v1", api_key="none")  # any string — nothing checks it
 
-result = client.audio.transcriptions.create(model="whisper-1", file=open("clip.wav", "rb"))
-print(result.text)
+# TTS with your cloned voice (or "alloy" / "default"; model= can pin a specific engine)
+with client.audio.speech.with_streaming_response.create(
+        model="tts-1", voice="<profile-id>", input="Made on my own hardware.") as r:
+    r.stream_to_file("speech.wav")
+
+# STT
+print(client.audio.transcriptions.create(model="whisper-1", file=open("clip.wav", "rb")).text)
 ```
 
 Want the whole surface (100+ endpoints)? The full REST API reference is embedded in the app — **Settings → OpenAPI Reference** (Scalar-powered), or the `{}` button in the footer.
