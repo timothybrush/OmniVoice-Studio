@@ -40,6 +40,8 @@ _HINTS: dict[str, str] = {
     "PYANNOTE_LICENSE_REQUIRED": "Accept the pyannote model licenses on Hugging Face, then retry.",
     "COMPUTE_TYPE_UNSUPPORTED": "Your GPU doesn't support float16 — OmniVoice retried on int8. If transcription still fails, set OMNIVOICE/ASR_COMPUTE_TYPE=int8 or use CPU.",
     "TRANSFORMERS_IMPORT": "Your transformers install is incomplete. Reinstall it (`uv pip install --reinstall transformers`) or switch ASR to faster-whisper (Settings → Models).",
+    "WINDOWS_APP_CONTROL_BLOCKED": "Windows refused to load a file OmniVoice needs — an Application Control policy (Smart App Control, WDAC, or AppLocker) blocked it. On a personal PC: Windows Security → App & browser control → Smart App Control → Off (Windows only lets you turn it off once — re-enabling requires a Windows reset), then restart OmniVoice. On a managed/work PC, ask IT to allow the OmniVoice install folder.",
+    "AUDIO_IO_FAILED": "An audio file couldn't be read or written at the OS level. Check the drive isn't full, that the output and temp folders exist and are writable, and that antivirus or OneDrive isn't locking them (add an OmniVoice exclusion if you use one).",
     "OS_INVALID_ARGUMENT": "The OS rejected a file operation (Errno 22 / invalid argument) — in the transcribe path this is the temporary WAV write before ASR. It's almost always the temp directory: missing, read-only, on a full or removed drive, or blocked by antivirus. Check that your system TEMP/TMP folder exists and is writable and the drive has free space (add an OmniVoice antivirus exclusion if you use one), then retry.",
     "SOCKS_PROXY_SUPPORT_MISSING": "A SOCKS proxy is configured in your environment (ALL_PROXY/HTTPS_PROXY=socks5://…) and the backend's HTTP client is missing SOCKS support. Newer OmniVoice builds ship SOCKS support (the socksio package) — update the app. If you still see this, unset ALL_PROXY/HTTPS_PROXY for OmniVoice, or run `uv pip install 'httpx[socks]'` in the backend venv, then restart.",
     "SSL_HANDSHAKE_FAILURE": "A corporate or antivirus proxy is intercepting HTTPS traffic and re-signing certificates with its own CA — your OS trusts that CA, but Python's bundled certifi CA list doesn't, so the TLS handshake fails even though the connection reached the server. Newer OmniVoice builds trust the OS certificate store at startup (the truststore package), which should already fix this — update the app and retry. If you still see this, add an HTTPS-scanning exclusion for OmniVoice/Python in your antivirus, or ask IT for the proxy's CA bundle and set SSL_CERT_FILE to it, then restart.",
@@ -326,6 +328,20 @@ def classify(reason: str) -> str:
         or "timed out" in low
     ):
         return "VIDEO_DOWNLOAD_NETWORK"
+    # #1227: Windows Smart App Control / WDAC / AppLocker refused to load a
+    # file the app needs. Matched on the numeric codes (locale-independent —
+    # the OS translates the message text) plus the English policy phrase.
+    if (
+        "[winerror 4551]" in low
+        or "[winerror 1260]" in low
+        or "application control policy" in low
+    ):
+        return "WINDOWS_APP_CONTROL_BLOCKED"
+    # #1221: libsndfile failed an OS-level audio read/write. Its own wording is
+    # a bare "System error.", so match the library name — audio_io already
+    # prefixes the target path and free space onto the write-path failures.
+    if "libsndfile" in low:
+        return "AUDIO_IO_FAILED"
     # A relocated/corrupted venv whose interpreter can't bootstrap its stdlib —
     # the Rust self-heal rebuilds it; this names the class for the toast.
     if "no module named 'encodings'" in low:

@@ -6,6 +6,17 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 Versions track the desktop app (`tauri.conf.json` + `frontend/src-tauri/Cargo.toml`).
 The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
+## [Unreleased]
+
+**Highlights**
+
+- Two synth failures that used to say "an error OmniVoice doesn't recognize" now say what actually went wrong
+
+### Fixed
+
+- Windows Smart App Control / WDAC / AppLocker blocking an engine file is now named, with the exact setting to change, instead of surfacing as an unrecognized error (#1227) — thanks @AdityaHemantBhat!
+- A failed audio read/write (`LibsndfileError: System error.`) now names the target file, its folder's writability and the drive's free space, and points at the usual causes — full disk, locked folder, antivirus (#1221) — thanks @morozov28061995-boop!
+
 ## [0.4.0] — 2026-07-21
 
 **Highlights**

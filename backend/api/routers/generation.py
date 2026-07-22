@@ -363,6 +363,39 @@ def _oom_friendly_reraise(e):
             f"([WinError 193]). Reinstall or repair that component — the Flush "
             f"button won't help here. Underlying error: {e}"
         ) from e
+    # #1227: Windows Smart App Control / an App Control (WDAC) policy blocked
+    # a file the engine needs — "[WinError 4551] An Application Control policy
+    # has blocked this file". WinError 1260 is the same class from the older
+    # Software Restriction / AppLocker policies. Not OOM, and Flush can't help:
+    # the OS is refusing to load the binary at all.
+    if ("[winerror 4551]" in _low or "[winerror 1260]" in _low
+            or "application control policy" in _low):
+        raise RuntimeError(
+            f"Windows blocked a file OmniVoice needs from running — an "
+            f"Application Control policy (Smart App Control, WDAC, or "
+            f"AppLocker) refused to load it. On a personal PC: Windows "
+            f"Security → App & browser control → Smart App Control → Off "
+            f"(note Windows only lets you turn it off once — re-enabling "
+            f"needs a Windows reset), then restart OmniVoice. On a managed/"
+            f"work PC ask IT to allow the OmniVoice install folder. The Flush "
+            f"button won't help. Underlying error: {e}"
+        ) from e
+    # #1221: libsndfile/soundfile could not read or write an audio file. Its
+    # errors are bare ("LibsndfileError: System error.") so they used to fall
+    # through to the unrecognized catch-all. audio_io._describe_write_failure
+    # already names the target for the WRITE path; this covers every other
+    # libsndfile surface (reading a reference clip, a decode) with the causes
+    # that actually produce an OS-level audio I/O failure.
+    if "libsndfile" in _low or "error opening" in _low:
+        raise RuntimeError(
+            f"An audio file couldn't be read or written (libsndfile failed at "
+            f"the OS level). This is a file/disk problem, not a memory one: "
+            f"check the drive isn't full, the output and temp folders exist "
+            f"and are writable, and that antivirus or OneDrive isn't locking "
+            f"them (add an OmniVoice exclusion if you use one). If it happens "
+            f"only with one reference clip, re-import that clip. Underlying "
+            f"error: {e}"
+        ) from e
     # #715: a "[Errno 32] Broken pipe" (BrokenPipeError) surfacing from
     # generation is NOT out of memory — it means the backend's stdout/stderr
     # pipe to the desktop shell that launched it closed mid-render (an orphaned

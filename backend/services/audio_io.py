@@ -50,6 +50,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import shutil
 import tempfile
 from typing import Any, BinaryIO, Union
 
@@ -196,8 +197,54 @@ def _safe_torchaudio_save(
                     fmt, e,
                 )
                 torchaudio.save(path_or_buf, tensor, sample_rate, format=fmt)
+    except Exception as e:
+        # #1221: libsndfile reports OS-level write failures as a bare
+        # "LibsndfileError: System error." — no path, no errno, nothing the
+        # user can act on, and it fell through generation.py's classifier to
+        # "an error OmniVoice doesn't recognize". Name the target and what we
+        # can observe about it (exists / writable / free space) so the message
+        # points at the actual problem: a full disk, a read-only or
+        # antivirus-locked output folder, or a removed drive.
+        raise _describe_write_failure(e, path_or_buf) from e
+
+
+def _describe_write_failure(e: Exception, path_or_buf: PathOrBuf) -> Exception:
+    """``e`` re-raised as a RuntimeError that names the write target, or ``e``
+    itself when there is nothing to add.
+
+    The type is deliberately NOT preserved: ``LibsndfileError.__init__`` takes
+    an integer libsndfile code, so ``type(e)(message)`` builds an exception
+    whose ``str()`` raises. Every caller of ``_safe_torchaudio_save`` catches
+    broadly, and the original stays reachable as ``__cause__``.
+
+    Best-effort — a failure to diagnose must never replace the real error."""
+    try:
+        if not isinstance(path_or_buf, (str, os.PathLike)):
+            return e  # in-memory buffer: nothing to inspect
+        path = os.fspath(path_or_buf)
+        if getattr(e, "filename", None) or path in str(e):
+            return e  # already self-describing
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        facts = []
+        if not os.path.isdir(directory):
+            facts.append("the folder does not exist")
+        else:
+            if not os.access(directory, os.W_OK):
+                facts.append("the folder is not writable")
+            try:
+                free_mb = shutil.disk_usage(directory).free / (1024 ** 2)
+                facts.append(f"{free_mb:,.0f} MB free on its drive")
+            except OSError:
+                facts.append("free space could not be read")
+        return RuntimeError(
+            f"Writing the audio file failed: {type(e).__name__}: {e} — target "
+            f"{path} ({'; '.join(facts)}). An audio write failing at the OS "
+            f"level is usually a full drive, a read-only or removed folder, or "
+            f"antivirus/OneDrive locking the file; add an OmniVoice exclusion "
+            f"if you use one."
+        )
     except Exception:
-        raise
+        return e
 
 
 def _safe_soundfile_write(
