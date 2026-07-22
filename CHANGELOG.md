@@ -12,6 +12,7 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 
 - AMD GPUs are used again — every ROCm host was silently running on the CPU
 - Two synth failures that used to say "an error OmniVoice doesn't recognize" now say what actually went wrong
+- A dub URL ingest that fails on a disk problem now says which folder and why
 
 ### Docs
 
@@ -24,6 +25,8 @@ The bundled TTS model package (`pyproject.toml`) is versioned independently.
 - AMD/ROCm: `HSA_OVERRIDE_GFX_VERSION` is auto-set only when your card genuinely needs it and the remap target exists in your build; gfx1150/gfx1151 (Strix Point/Halo) added to the map (#1228)
 - Windows blocking an engine file (Smart App Control, WDAC, or AppLocker) is now named, with the fix for personal and managed PCs — thanks @AdityaHemantBhat! (#1227)
 - A failed audio write (`LibsndfileError: System error.`) now names the target file, its folder's writability and the drive's free space — thanks @morozov28061995-boop! (#1221)
+- Dub URL ingest: a disk error now names the job folder, its writability and the drive's free space, instead of pointing at the system TEMP folder it never used — thanks @dustmaker124-ui! (#1225)
+- Dub URL ingest fails immediately when the job folder is missing or unwritable, instead of starting a download that can only fail (#1225)
 
 ## [0.4.0] — 2026-07-21
 

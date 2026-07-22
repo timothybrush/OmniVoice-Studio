@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -42,6 +43,7 @@ _HINTS: dict[str, str] = {
     "TRANSFORMERS_IMPORT": "Your transformers install is incomplete. Reinstall it (`uv pip install --reinstall transformers`) or switch ASR to faster-whisper (Settings → Models).",
     "WINDOWS_APP_CONTROL_BLOCKED": "Windows refused to load a file OmniVoice needs — an Application Control policy (Smart App Control, WDAC, or AppLocker) blocked it. On a personal PC: Windows Security → App & browser control → Smart App Control → Off (Windows only lets you turn it off once — re-enabling requires a Windows reset), then restart OmniVoice. On a managed/work PC, ask IT to allow the OmniVoice install folder.",
     "AUDIO_IO_FAILED": "An audio file couldn't be read or written at the OS level. Check the drive isn't full, that the output and temp folders exist and are writable, and that antivirus or OneDrive isn't locking them (add an OmniVoice exclusion if you use one).",
+    "VIDEO_DOWNLOAD_OS_ERROR": "The OS refused a file operation while saving the downloaded video — this is a disk/folder problem, not a network one, so retrying the same link won't help. The download is written to a job folder under your OmniVoice data directory (Settings → Storage shows the path): check that drive isn't full, that the folder exists and is writable, and that antivirus or a cloud-sync client (OneDrive, Dropbox) isn't locking it — add an OmniVoice exclusion if you use one. If your data directory sits on a synced or network drive, move it to a local one.",
     "OS_INVALID_ARGUMENT": "The OS rejected a file operation (Errno 22 / invalid argument) — in the transcribe path this is the temporary WAV write before ASR. It's almost always the temp directory: missing, read-only, on a full or removed drive, or blocked by antivirus. Check that your system TEMP/TMP folder exists and is writable and the drive has free space (add an OmniVoice antivirus exclusion if you use one), then retry.",
     "SOCKS_PROXY_SUPPORT_MISSING": "A SOCKS proxy is configured in your environment (ALL_PROXY/HTTPS_PROXY=socks5://…) and the backend's HTTP client is missing SOCKS support. Newer OmniVoice builds ship SOCKS support (the socksio package) — update the app. If you still see this, unset ALL_PROXY/HTTPS_PROXY for OmniVoice, or run `uv pip install 'httpx[socks]'` in the backend venv, then restart.",
     "SSL_HANDSHAKE_FAILURE": "A corporate or antivirus proxy is intercepting HTTPS traffic and re-signing certificates with its own CA — your OS trusts that CA, but Python's bundled certifi CA list doesn't, so the TLS handshake fails even though the connection reached the server. Newer OmniVoice builds trust the OS certificate store at startup (the truststore package), which should already fix this — update the app and retry. If you still see this, add an HTTPS-scanning exclusion for OmniVoice/Python in your antivirus, or ask IT for the proxy's CA bundle and set SSL_CERT_FILE to it, then restart.",
@@ -249,6 +251,15 @@ def classify(reason: str) -> str:
     # argument" wording) keeps this from mislabelling unrelated failures; the
     # transformers "errno 2" rule below is unaffected — it also requires the
     # transformers + site-packages markers, which this signature lacks.
+    # #1225: the same errno raised by the DUB video download is a different
+    # class with a different remedy — the failing directory is the job folder
+    # under the OmniVoice data dir, not the system temp dir. Checked first so
+    # a download's errno 22 stops being handed the transcribe path's
+    # "check your TEMP folder" hint, which sends the user to the wrong place.
+    if is_os_write_refusal(reason) and any(
+        marker in low for marker in _DOWNLOAD_CONTEXT_MARKERS
+    ):
+        return "VIDEO_DOWNLOAD_OS_ERROR"
     if "errno 22" in low:
         return "OS_INVALID_ARGUMENT"
     # An HF cache whose snapshot entries don't resolve (dangling symlinks /
@@ -430,6 +441,67 @@ def diagnostic(*, reason: str, error_class: str, stage: str) -> str:
         f"{_env_summary()}\n"
     )
     return sanitize(block)
+
+
+# Signatures of the OS refusing a file operation. One list, because two
+# consumers must agree: ``classify`` (which picks the class + hint) and
+# ``dub_pipeline._with_target_facts`` (which decides whether to attach the
+# destination). When they drifted, an ENOENT download classified as a disk
+# problem but never got the folder named — the one fact that would have made
+# the message actionable (#1225 review).
+_OS_WRITE_REFUSAL_SIGNATURES = (
+    "errno 22", "invalid argument",
+    "errno 13", "permission denied",
+    "errno 28", "no space left",
+    "errno 2", "no such file or directory",
+    "unable to open for writing",
+    "unable to rename file",
+)
+
+# Wording that places a failure in the video-download path specifically.
+_DOWNLOAD_CONTEXT_MARKERS = (
+    "unable to download video",
+    "unable to open for writing",
+    "unable to rename file",
+    "yt_dlp",
+    "yt-dlp",
+)
+
+
+def is_os_write_refusal(reason: Optional[str]) -> bool:
+    """True when *reason* looks like the OS refusing a file operation (a full
+    or removed drive, a read-only folder, an antivirus/cloud-sync lock) rather
+    than a network or format failure. Signature match only; never raises."""
+    low = (reason or "").lower()
+    return any(sig in low for sig in _OS_WRITE_REFUSAL_SIGNATURES)
+
+
+def describe_path_target(path: str) -> str:
+    """Observable facts about where we were writing — "the folder does not
+    exist", "the folder is not writable", "1,234 MB free on its drive".
+
+    A bare OS error ("[Errno 22] Invalid argument", "System error.") names
+    neither the target nor the reason, which is what makes those reports
+    un-actionable (#1225). Attaching what we CAN see distinguishes a full
+    drive from a removed one from an antivirus/OneDrive lock. Never raises —
+    diagnosis must never replace the failure being diagnosed.
+    """
+    facts: list[str] = []
+    try:
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        if not os.path.isdir(directory):
+            facts.append("the folder does not exist")
+        else:
+            if not os.access(directory, os.W_OK):
+                facts.append("the folder is not writable")
+            try:
+                free_mb = shutil.disk_usage(directory).free / (1024 ** 2)
+                facts.append(f"{free_mb:,.0f} MB free on its drive")
+            except OSError:
+                facts.append("free space could not be read")
+    except Exception:
+        return ""
+    return "; ".join(facts)
 
 
 def build_failure(
