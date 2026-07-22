@@ -149,6 +149,39 @@ fn raw_http_get(url: &str, timeout: Duration) -> Result<String, String> {
     Ok(buf)
 }
 
+/// Exit code `backend/main.py` uses when it could not bind the port (#1223).
+/// Keep in sync with `_EXIT_PORT_IN_USE` there.
+pub const EXIT_PORT_IN_USE: i32 = 78;
+
+/// Kill whoever holds `port`, then confirm it actually came free.
+///
+/// #1223: every caller used to kill-then-sleep-then-spawn unconditionally, so
+/// a holder we cannot kill — a different user's process, a `taskkill` blocked
+/// by policy, a socket sitting in TIME_WAIT that the Windows `netstat`
+/// LISTENING filter can't even see — was indistinguishable from success. The
+/// backend then died on the bind with a raw errno and the user got "Backend
+/// died (exit code 1)".
+///
+/// Returns true when the port is free afterwards. Polls rather than sleeping a
+/// flat interval: the common case (our own orphan) frees in well under 500ms,
+/// and the uncommon case deserves longer than one guess.
+pub fn free_port_or_report(port: u16) -> bool {
+    kill_orphan_on_port(port);
+    for _ in 0..20 {
+        if !port_in_use(port) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    log::error!(
+        "Port {} is still held after attempting to kill its owner — the \
+         backend cannot bind it. Another application (or a process owned by a \
+         different user) is using the port.",
+        port
+    );
+    false
+}
+
 /// Kill whatever process owns the port.
 #[cfg(unix)]
 pub fn kill_orphan_on_port(port: u16) {

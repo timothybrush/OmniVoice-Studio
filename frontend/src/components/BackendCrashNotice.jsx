@@ -6,6 +6,7 @@ import { Button, Dialog } from '../ui';
 import {
   acknowledgeBackendCrash,
   crashAge,
+  crashCauseHint,
   describeCrashExit,
   getUnacknowledgedBackendCrash,
 } from '../utils/backendCrash';
@@ -137,6 +138,12 @@ export default function BackendCrashNotice() {
           <p className="m-0 text-[length:var(--text-sm)] text-fg-muted">
             {t('crash.details_intro', { exit, ago })}
           </p>
+          {/* #1223: crashCauseHint knows what each exit shape actually means
+              (a port conflict is not a crash; signal 9 is the OS memory
+              killer, not VRAM). It existed but was only used on the
+              stream-drop path, so the dialog showed a bare "exit code 1" with
+              no explanation — the one place a user comes to for one. */}
+          <p className="m-0 text-[length:var(--text-sm)] text-fg">{crashCauseHint(marker)}</p>
           <dl className="m-0 grid grid-cols-[max-content_1fr] gap-x-[var(--space-5)] gap-y-[var(--space-2)] text-[length:var(--text-sm)]">
             <dt className="text-fg-subtle">{t('crash.field_exit')}</dt>
             <dd className="m-0 font-mono text-fg">{exit}</dd>

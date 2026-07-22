@@ -196,6 +196,18 @@ export function describeCrashExit(
  * the dominant cause for real GPU aborts.
  */
 export function crashCauseHint(marker: Pick<BackendCrashMarker, 'exit_code' | 'signal'>): string {
+  // #1223: the backend exits 78 (EX_CONFIG) when it could not bind its port.
+  // That is not a crash and has nothing to do with memory — the old message
+  // sent a user whose real problem was a leftover process off to shrink their
+  // ASR model. Keep in sync with _EXIT_PORT_IN_USE in backend/main.py.
+  if (marker.exit_code === 78) {
+    return (
+      'The backend could not start because port 3900 is already in use — another copy of ' +
+      'OmniVoice (or an app that claimed that port) is holding it. Quit the other instance and ' +
+      'relaunch; if nothing is visibly running, an orphaned backend from a previous session is ' +
+      'still holding the port.'
+    );
+  }
   if (marker.signal === 9) {
     return (
       'It was force-killed (signal 9), which usually means the operating system ran out of ' +

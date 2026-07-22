@@ -141,7 +141,18 @@ export function detectHints(message, logs = []) {
   if (/uv sync failed/i.test(all)) hints.push('bootstrap.hint_uv_sync');
   if (/hatchling|build_editable/i.test(all)) hints.push('bootstrap.hint_build_backend');
   if (/ffmpeg/i.test(all) && /download|timeout/i.test(all)) hints.push('bootstrap.hint_ffmpeg');
-  if (/port.*in use|address.*in use/i.test(all)) hints.push('bootstrap.hint_port');
+  // #1223: Windows' WSAEADDRINUSE text is "only one usage of each socket
+  // address is normally permitted" — it contains neither "port ... in use" nor
+  // "address ... in use", and the OS translates it into the user's locale
+  // (the report that surfaced this was in Russian). Match the locale-
+  // independent errnos too: 10048 (Windows), 48 (macOS/BSD), 98 (Linux), and
+  // the backend's own EX_CONFIG exit code for this case.
+  if (
+    /port.*in use|address.*in use|errno 10048|errno 48|errno 98|only one usage of each socket|exit code 78/i.test(
+      all,
+    )
+  )
+    hints.push('bootstrap.hint_port');
   if (/no error output/i.test(all)) hints.push('bootstrap.hint_silent_crash');
   if (/seems stuck at|never reported ready/i.test(all)) hints.push('bootstrap.hint_stuck');
   if (/blocking GitHub|couldn't download Python|python-build-standalone|dns error/i.test(all))

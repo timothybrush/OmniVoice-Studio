@@ -1295,6 +1295,12 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
+    # Distinct exit code for "the port was already taken" (#1223), so the
+    # desktop shell can tell that apart from a crash without parsing an
+    # OS-translated error string. Kept out of the 0-2 range the interpreter
+    # itself uses, and mirrored in frontend/src-tauri/src/backend.rs.
+    _EXIT_PORT_IN_USE = 78  # EX_CONFIG, sysexits.h
+
     # Port 3900 picked to dodge common 8000 conflicts (Django/Rails/Jupyter).
     # Rust sidecar launcher in lib.rs::BACKEND_PORT must stay in sync.
     #
@@ -1305,4 +1311,25 @@ if __name__ == "__main__":
     # set OMNIVOICE_BIND_HOST=0.0.0.0 explicitly (see deploy/docker-compose.yml)
     # — the host-side port mapping is what enforces 127.0.0.1-only there.
     _bind_host = os.environ.get("OMNIVOICE_BIND_HOST", "127.0.0.1")
-    uvicorn.run(app, host=_bind_host, port=_port)
+    try:
+        uvicorn.run(app, host=_bind_host, port=_port)
+    except OSError as e:
+        # #1223: uvicorn's bind failure is a raw errno, and the Windows wording
+        # ("only one usage of each socket address is normally permitted") is
+        # OS-translated into the user's locale — so neither the log nor the
+        # desktop shell's pattern matcher recognized it, and the user got a
+        # bare "Backend died (exit code 1)". errno is locale-independent:
+        # EADDRINUSE is 48 on macOS/BSD, 98 on Linux, WSAEADDRINUSE 10048 on
+        # Windows (surfaced as errno 10048 by CPython's socket layer).
+        if e.errno in (48, 98, 10048) or getattr(e, "winerror", None) == 10048:
+            print(
+                f"FATAL: port {_port} is already in use — another OmniVoice "
+                f"backend (or another app) is listening on it. Quit the other "
+                f"instance and relaunch; if nothing is visibly running, an "
+                f"orphaned backend from a previous session is still holding "
+                f"the port. Underlying error: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(_EXIT_PORT_IN_USE)
+        raise

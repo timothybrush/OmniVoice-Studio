@@ -260,8 +260,24 @@ pub fn respawn_backend(
         if crate::backend::port_in_use(backend_port()) {
             log::warn!("Port {} in use — taking ownership", backend_port());
             set_backend_kill_intended(true); // deliberate kill, not a crash (#941)
-            crate::backend::kill_orphan_on_port(backend_port());
-            std::thread::sleep(Duration::from_millis(500));
+            // #1223: verify the port actually came free. Spawning into a port
+            // we failed to reclaim just moves the failure into the backend,
+            // where it surfaced as an unexplained "exit code 1".
+            if !crate::backend::free_port_or_report(backend_port()) {
+                set_stage(
+                    &stage_handle,
+                    BootstrapStage::Failed {
+                        message: format!(
+                            "Port {} is already in use by another application, \
+                             and OmniVoice could not free it. Quit whatever is \
+                             using that port (another copy of OmniVoice, or an \
+                             app that claimed it) and try again.",
+                            backend_port()
+                        ),
+                    },
+                );
+                return;
+            }
         }
         spawn_backend_and_wait(&app, &stage_handle);
     });
@@ -399,7 +415,24 @@ pub fn spawn_backend_and_wait(app: &tauri::AppHandle, stage_handle: &Arc<Mutex<B
                     );
                     return;
                 }
-                let msg = if err_tail.is_empty() {
+                // #1223: the backend exits EXIT_PORT_IN_USE when it could not
+                // bind its port. That is a conflict, not a crash — say what to
+                // do instead of dumping a traceback whose one meaningful line
+                // is an OS-translated errno.
+                let msg = if real_exit
+                    .as_ref()
+                    .and_then(|e| e.code)
+                    .is_some_and(|c| c == crate::backend::EXIT_PORT_IN_USE)
+                {
+                    format!(
+                        "Port {} is already in use, so the backend could not \
+                         start. Another copy of OmniVoice — or an app that \
+                         claimed that port — is holding it. Quit it and try \
+                         again; if nothing is visibly running, an orphaned \
+                         backend from a previous session still has the port.",
+                        backend_port()
+                    )
+                } else if err_tail.is_empty() {
                     format!("Backend process exited ({}) — no error output captured", exit_info)
                 } else {
                     format!("Backend process exited ({}):\n{}", exit_info, err_tail)
@@ -578,10 +611,24 @@ fn supervise_backend(app: &tauri::AppHandle, stage_handle: &Arc<Mutex<BootstrapS
         // poll has already stopped post-Ready, so the stage alone won't show).
         let _ = app.emit("backend-restarting", exit_info.clone());
         set_stage(stage_handle, BootstrapStage::StartingBackend);
-        // Clear any orphan still holding the port before the respawn.
-        if crate::backend::port_in_use(backend_port()) {
-            crate::backend::kill_orphan_on_port(backend_port());
-            std::thread::sleep(Duration::from_millis(300));
+        // Clear any orphan still holding the port before the respawn. #1223:
+        // if it can't be cleared, respawning just reproduces the bind failure
+        // — stop and say so rather than burning a restart attempt.
+        if crate::backend::port_in_use(backend_port())
+            && !crate::backend::free_port_or_report(backend_port())
+        {
+            set_stage(
+                stage_handle,
+                BootstrapStage::Failed {
+                    message: format!(
+                        "Port {} is held by another application and OmniVoice \
+                         could not free it, so the backend can't restart. Quit \
+                         whatever is using that port and relaunch.",
+                        backend_port()
+                    ),
+                },
+            );
+            return;
         }
         let child = crate::backend::spawn_backend(app, Some(stage_handle));
         track_backend_child(app, child);
